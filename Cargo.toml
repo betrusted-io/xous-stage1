@@ -1,0 +1,14 @@
+[package]
+name = "xous-stage1"
+version = "0.1.0"
+authors = ["Sean Cross <sean@xobs.io>"]
+edition = "2018"
+description = "Stage 1 loader for Xous"
+
+[dependencies]
+
+[profile.release]
+codegen-units = 1 # 1 better optimizations
+debug = true # symbols are nice and they don't increase the size on Flash
+lto = true
+#opt-level=0

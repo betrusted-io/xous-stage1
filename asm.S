@@ -2,7 +2,8 @@
 .global _start
 
 _start:
-    jal zero, prepare_memory
+    li a0, 0x20600000
+    j prepare_memory
 
 .global abort
 abort:

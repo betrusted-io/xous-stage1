@@ -97,7 +97,7 @@ fn process_tags(b8: *mut u8) -> Result<(u32, *mut u32, u32), ()> {
         let (tag_name, crc, size) =
             read_next_tag(b8, &mut byte_offset).expect("couldn't read next tag");
         if tag_name == make_type!("MBLK") {
-            mem_start = unsafe { (b8 as *mut u32).add(byte_offset) };
+            mem_start = unsafe { b8.add(byte_offset) as *mut u32 };
             mem_size = size;
         }
         byte_offset += size as usize;
@@ -124,7 +124,7 @@ pub unsafe extern "C" fn prepare_memory(arg_buffer: *mut u8, _signature: u32) ->
 
     // Number of individual pages in the system
     let mut mem_page_count = 0;
-    for region_offset in (0 .. regions_size as usize).step_by(3) {
+    for region_offset in (0 .. (regions_size/4) as usize).step_by(3) {
         let _region_start = regions_start.add(region_offset + 0).read();
         let region_length = regions_start.add(region_offset + 1).read();
         let _region_name = regions_start.add(region_offset + 2).read();
@@ -132,7 +132,7 @@ pub unsafe extern "C" fn prepare_memory(arg_buffer: *mut u8, _signature: u32) ->
     }
     // Ensure we have a number of pages divisible by 4, since everything is done
     // with 32-bit math.
-    mem_page_count = mem_page_count + (!mem_page_count & !(4 - 1));
+    mem_page_count = mem_page_count + ((4-(mem_page_count&3)) & 3);
 
     // Copy the args list to target RAM
     let runtime_arg_buffer = (sram_start + sram_len - args_size) as *mut u32;
@@ -143,7 +143,7 @@ pub unsafe extern "C" fn prepare_memory(arg_buffer: *mut u8, _signature: u32) ->
     bzero(memory_pages, memory_pages.add((mem_page_count / 4) as usize));
 
     // Mark these pages as being owned by PID1
-    for offset in (sram_len-args_size-mem_page_count/4096) .. (sram_len/4096) {
+    for offset in (sram_len-args_size-mem_page_count)/4096 .. (sram_len/4096) {
         (memory_pages as *mut u8).add(offset as usize).write(1);
     }
 

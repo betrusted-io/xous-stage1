@@ -11,6 +11,59 @@ struct PageTable {
     entries: [u32; 1024],
 }
 
+/// This describes both the kernel and PID1
+struct ProgramDescription {
+    /// Physical source address of this program in RAM (i.e. SPI flash)
+    load_offset: u32,
+
+    /// How many bytes of data to load from the source to the target
+    load_size: u32,
+
+    /// Start of the virtual address where the .text section will go.
+    /// This section will be marked non-writable, executable.
+    text_offset: u32,
+
+    /// Start of the virtual address of .data and .bss section in RAM.
+    /// This will simply allocate this memory and mark it "read-write"
+    /// without actually copying any data.
+    data_offset: u32,
+
+    /// Size of .data and .bss section.  This many bytes will be allocated
+    /// for the data section.
+    data_size: u32,
+
+    /// Virtual address entry point.
+    entrypoint: u32,
+
+    /// Virtual address of the top of the stack pointer.  This process will
+    /// get one page allocated.  Additional pages will be allocated as stack
+    /// grows and faults occur.
+    stack_offset: u32,
+}
+
+impl ProgramDescription {
+    pub fn load(&self, allocator: &mut Allocator, pid1_satp: &mut PageTable, sp_page: u32) -> u32 {
+        allocator.map_page(pid1_satp, sp_page, self.stack_offset);
+        assert!((self.load_offset & (PAGE_SIZE - 1)) == 0);
+        assert!((self.data_offset & (PAGE_SIZE - 1)) == 0);
+        for offset in (0..self.load_size).step_by(PAGE_SIZE as usize) {
+            let page_addr = allocator.alloc();
+            allocator.map_page(pid1_satp, page_addr as u32, self.text_offset + offset);
+            let mut to_copy = PAGE_SIZE;
+            if self.load_size - offset < to_copy {
+                to_copy = self.load_size - offset;
+            }
+            unsafe { memcpy(page_addr, (self.load_offset + offset) as *mut u32, to_copy as usize) };
+        }
+
+        for offset in (0..self.data_size).step_by(PAGE_SIZE as usize) {
+            let page_addr = allocator.alloc();
+            allocator.map_page(pid1_satp, page_addr as u32, self.data_offset + offset);
+        }
+        self.entrypoint
+    }
+}
+
 macro_rules! make_type {
     ($fcc:expr) => {{
         let mut c: [u8; 4] = Default::default();
@@ -235,7 +288,7 @@ impl Allocator {
             unsafe { &mut (*(((l1_pt[vpn1 as usize] << 2) & !((1 << 12) - 1)) as *mut PageTable)) };
         let ref mut l0_pt = l0_pt_idx.entries;
 
-        // Allocate a new level 0 pagetable entry if one doesn't exist.
+        // Ensure the entry hasn't already been mapped.
         if l0_pt[vpn0 as usize] & 1 != 0 {
             panic!("Page already allocated!");
         }
@@ -279,64 +332,17 @@ fn stage2(
         let (tag_name, _crc, size) =
             read_next_tag(runtime_args, &mut args_offset).expect("couldn't read next tag");
         if tag_name == make_type!("PID1") {
-            assert!(size == 28, "invalid PID1 size");
             assert!(!pid1_seen, "pid1 appears twice");
-            let pid1_base = unsafe { runtime_args.add(args_offset) as *mut u32 };
-            let load_offset = unsafe { pid1_base.add(0).read() };
-            let load_size = unsafe { pid1_base.add(1).read() };
-            let text_offset = unsafe { pid1_base.add(2).read() };
-            let data_offset = unsafe { pid1_base.add(3).read() };
-            let data_size = unsafe { pid1_base.add(4).read() };
-            pid1_entrypoint = unsafe { pid1_base.add(5).read() };
-            let stack = unsafe { pid1_base.add(6).read() };
-            allocator.map_page(pid1_satp, sp_page, stack);
-            assert!((load_offset & (PAGE_SIZE - 1)) == 0);
-            assert!((data_offset & (PAGE_SIZE - 1)) == 0);
-            for offset in (0..load_size).step_by(PAGE_SIZE as usize) {
-                let page_addr = allocator.alloc();
-                allocator.map_page(pid1_satp, page_addr as u32, text_offset + offset);
-                let mut to_copy = PAGE_SIZE;
-                if load_size - offset < to_copy {
-                    to_copy = load_size - offset;
-                }
-                unsafe { memcpy(page_addr, (load_offset + offset) as *mut u32, to_copy as usize) };
-            }
-
-            for offset in (0..data_size).step_by(PAGE_SIZE as usize) {
-                let page_addr = allocator.alloc();
-                allocator.map_page(pid1_satp, page_addr as u32, data_offset + offset);
-            }
-
+            assert!(size == 28, "invalid PID1 size");
+            let pid1 = unsafe { & *(runtime_args.add(args_offset) as *const ProgramDescription) };
+            pid1.load(&mut allocator, pid1_satp, sp_page);
             pid1_seen = true;
         }
         if tag_name == make_type!("XKRN") {
             assert!(size == 24, "invalid XKRN size");
             assert!(!xkrn_seen, "xkrn appears twice");
-            let xkrn_base = unsafe { runtime_args.add(args_offset) as *mut u32 };
-            let load_offset = unsafe { xkrn_base.add(0).read() };
-            let load_size = unsafe { xkrn_base.add(1).read() };
-            let text_offset = unsafe { xkrn_base.add(2).read() };
-            let data_offset = unsafe { xkrn_base.add(3).read() };
-            let data_size = unsafe { xkrn_base.add(4).read() };
-            kernel_entrypoint = unsafe { xkrn_base.add(5).read() };
-
-            assert!((load_offset & (PAGE_SIZE - 1)) == 0);
-            assert!((data_offset & (PAGE_SIZE - 1)) == 0);
-            for offset in (0..load_size).step_by(PAGE_SIZE as usize) {
-                let page_addr = allocator.alloc();
-                allocator.map_page(pid1_satp, page_addr as u32, text_offset + offset);
-                let mut to_copy = PAGE_SIZE;
-                if load_size - offset < to_copy {
-                    to_copy = load_size - offset;
-                }
-                unsafe { memcpy(page_addr, (load_offset + offset) as *mut u32, to_copy as usize) };
-            }
-
-            for offset in (0..data_size).step_by(PAGE_SIZE as usize) {
-                let page_addr = allocator.alloc();
-                allocator.map_page(pid1_satp, page_addr as u32, data_offset + offset);
-            }
-
+            let xkrn = unsafe { & *(runtime_args.add(args_offset) as *const ProgramDescription) };
+            kernel_entrypoint = xkrn.load(&mut allocator, pid1_satp, sp_page);
             xkrn_seen = true;
         }
     }

@@ -13,6 +13,7 @@ macro_rules! make_type {
 }
 
 extern "C" {
+    /// Set the stack pointer to the given address.
     fn set_sp(sp: u32);
 }
 
@@ -45,7 +46,7 @@ fn handle_panic(_arg: &PanicInfo) -> ! {
     loop {}
 }
 
-fn read_next_tag(b8: *mut u8, byte_offset: &mut usize) -> Result<(u32, u32, u32), ()> {
+fn read_next_tag(b8: *const u8, byte_offset: &mut usize) -> Result<(u32, u32, u32), ()> {
     let tag_name = u32::from_le(unsafe { (b8 as *mut u32).add(*byte_offset / 4).read() }) as u32;
     *byte_offset += 4;
     let crc = u16::from_le(unsafe { (b8 as *mut u16).add(*byte_offset / 2).read() }) as u32;
@@ -55,36 +56,7 @@ fn read_next_tag(b8: *mut u8, byte_offset: &mut usize) -> Result<(u32, u32, u32)
     Ok((tag_name, crc, size))
 }
 
-// fn add_more_memory(
-//     b8: *mut u8,
-//     tag_name: u32,
-//     size: u32,
-//     sram_start: &mut u32,
-//     sram_len: &mut u32,
-// ) -> Result<u32, ()> {
-//     let mut offset = 0;
-//     let mut required_bytes = 0;
-
-//     if tag_name != make_type!("MBLK") {
-//         return Ok(0);
-//     }
-//     if size < 3 {
-//         return Err(());
-//     }
-//     *sram_start = unsafe { (b8 as *mut u32).add(offset / 4 + 0).read() };
-//     *sram_len = unsafe { (b8 as *mut u32).add(offset / 4 + 1).read() };
-//     while offset < size as usize {
-//         let _start = unsafe { (b8 as *mut u32).add(offset / 4 + 0).read() };
-//         let length = unsafe { (b8 as *mut u32).add(offset / 4 + 1).read() };
-//         let _name = unsafe { (b8 as *mut u32).add(offset / 4 + 2).read() };
-//         offset += 12;
-
-//         required_bytes += length / 4096;
-//     }
-//     Ok(required_bytes)
-// }
-
-fn process_tags(b8: *mut u8) -> Result<(u32, *mut u32, u32), ()> {
+fn process_tags(b8: *const u8) -> Result<(u32, *mut u32, u32), ()> {
     let mut byte_offset = 0;
     let mut mem_start = 0 as *mut u32;
     let mut mem_size = 0;
@@ -94,7 +66,7 @@ fn process_tags(b8: *mut u8) -> Result<(u32, *mut u32, u32), ()> {
     if tag_name != make_type!("XASZ") || size != 4 {
         return Err(());
     }
-    let total_bytes = unsafe { (b8 as *mut u32).add(byte_offset / 4).read() } * 4;
+    let total_bytes = unsafe { (b8 as *const u32).add(byte_offset / 4).read() } * 4;
     byte_offset += 4;
 
     let required_bytes = total_bytes;
@@ -120,8 +92,11 @@ fn process_tags(b8: *mut u8) -> Result<(u32, *mut u32, u32), ()> {
     }
 }
 
+/// Stage 1 Bootloader
+/// This makes the program self-sufficient by setting up memory page assignment
+/// and copying the arguments to RAM
 #[export_name = "stage1"]
-pub unsafe extern "C" fn stage1(arg_buffer: *mut u8, _signature: u32) -> ! {
+pub unsafe extern "C" fn stage1(arg_buffer: *const u8, _signature: u32) -> ! {
     let (args_size, regions_start, regions_size) = process_tags(arg_buffer).unwrap();
 
     // The first region is defined as being "main RAM", which will be used
@@ -156,10 +131,15 @@ pub unsafe extern "C" fn stage1(arg_buffer: *mut u8, _signature: u32) -> ! {
         runtime_page_tracker.add((mem_page_count / 4) as usize),
     );
 
+    // Drop write permissions for the arg buffer
+    let runtime_arg_buffer = runtime_arg_buffer as *const u8;
+
     // Mark these pages as being owned by PID1.
     // Add an extra page to store the stack pointer, also owned by PID1.
     for offset in (sram_len - args_size - mem_page_count - 1) / 4096..(sram_len / 4096) {
-        (runtime_page_tracker as *mut XousPid).add(offset as usize).write(1);
+        (runtime_page_tracker as *mut XousPid)
+            .add(offset as usize)
+            .write(1);
     }
 
     // Up until now we've been using the stack pointer from the bootloader.
@@ -168,5 +148,60 @@ pub unsafe extern "C" fn stage1(arg_buffer: *mut u8, _signature: u32) -> ! {
     let sp = (runtime_page_tracker as u32 & !(4096 - 1)) - 4;
     set_sp(sp);
 
-    loop {}
+    stage2(
+        runtime_arg_buffer,
+        args_size,
+        runtime_page_tracker as *mut XousPid,
+        mem_page_count,
+        sram_start as *mut u8,
+        sram_len,
+    );
+}
+
+/// Stage 2 bootloader
+/// This sets up the MMU and loads both PID1 and the kernel into RAM.
+fn stage2(
+    runtime_args: *const u8,
+    runtime_args_len: u32,
+    runtime_page_tracker: *mut XousPid,
+    runtime_page_tracker_len: u32,
+    sram_start: *mut u8,
+    sram_len: u32,
+) -> ! {
+    let mut byte_offset = 0;
+
+    // next page offset is in units of bytes.
+    // The offset is from the start of SRAM.
+    let mut next_page_offset = (sram_len - runtime_args_len - runtime_page_tracker_len - 4096) & !(4096-1);
+
+    /// Zero-alloc a new page, mark it as owned by PID1, and return it.
+    /// Decrement the `next_page_offset` (npo) variable by one page.
+    fn alloc_page(
+        npo: &mut u32,
+        runtime_page_tracker: *mut XousPid,
+        sram_start: *mut u8,
+    ) -> *mut u32 {
+        *npo = *npo - 4096;
+        unsafe {
+            // Grab the page address and zero it out
+            let pg = sram_start.add(*npo as usize);
+            bzero(pg as *mut u32, pg.add(4096) as *mut u32);
+
+            // Mark this page as in-use by PID1
+            runtime_page_tracker
+                .add(*npo as usize / 4096)
+                .write_volatile(1);
+
+            // Return the address
+            pg as *mut u32
+        }
+    }
+
+    let pid1_satp = alloc_page(&mut next_page_offset, runtime_page_tracker, sram_start);
+    let pid1_stack = alloc_page(&mut next_page_offset, runtime_page_tracker, sram_start);
+
+    loop {
+        // let (tag_name, _crc, size) =
+        //     read_next_tag(runtime_args, &mut byte_offset).expect("couldn't read next tag");
+    }
 }

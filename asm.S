@@ -3,7 +3,7 @@
 
 _start:
     li a0, 0x20600000
-    j prepare_memory
+    j stage1
 
 .global abort
 abort:

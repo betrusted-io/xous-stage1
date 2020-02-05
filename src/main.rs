@@ -2,6 +2,7 @@
 #![no_main]
 
 use core::{mem, ptr};
+pub type XousPid = u8;
 
 macro_rules! make_type {
     ($fcc:expr) => {{
@@ -119,11 +120,12 @@ fn process_tags(b8: *mut u8) -> Result<(u32, *mut u32, u32), ()> {
     }
 }
 
-#[link_section = ".init.rust"]
-#[export_name = "prepare_memory"]
-pub unsafe extern "C" fn prepare_memory(arg_buffer: *mut u8, _signature: u32) -> ! {
+#[export_name = "stage1"]
+pub unsafe extern "C" fn stage1(arg_buffer: *mut u8, _signature: u32) -> ! {
     let (args_size, regions_start, regions_size) = process_tags(arg_buffer).unwrap();
 
+    // The first region is defined as being "main RAM", which will be used
+    // to keep track of allocations.
     let sram_start = regions_start.add(0 * 3 + 0).read();
     let sram_len = regions_start.add(0 * 3 + 1).read();
 
@@ -133,7 +135,7 @@ pub unsafe extern "C" fn prepare_memory(arg_buffer: *mut u8, _signature: u32) ->
         let _region_start = regions_start.add(region_offset + 0).read();
         let region_length = regions_start.add(region_offset + 1).read();
         let _region_name = regions_start.add(region_offset + 2).read();
-        mem_page_count += region_length * mem::size_of::<u8>() as u32 / 4096;
+        mem_page_count += region_length * mem::size_of::<XousPid>() as u32 / 4096;
     }
     // Ensure we have a number of pages divisible by 4, since everything is done
     // with 32-bit math.
@@ -148,21 +150,22 @@ pub unsafe extern "C" fn prepare_memory(arg_buffer: *mut u8, _signature: u32) ->
     );
 
     // Clear all memory pages such that they're not owned by anyone
-    let memory_pages = runtime_arg_buffer.sub((mem_page_count / 4) as usize);
+    let runtime_page_tracker = runtime_arg_buffer.sub((mem_page_count / 4) as usize);
     bzero(
-        memory_pages,
-        memory_pages.add((mem_page_count / 4) as usize),
+        runtime_page_tracker,
+        runtime_page_tracker.add((mem_page_count / 4) as usize),
     );
 
     // Mark these pages as being owned by PID1.
-    // Add an extra page to store the program counter in.
+    // Add an extra page to store the stack pointer, also owned by PID1.
     for offset in (sram_len - args_size - mem_page_count - 1) / 4096..(sram_len / 4096) {
-        (memory_pages as *mut u8).add(offset as usize).write(1);
+        (runtime_page_tracker as *mut XousPid).add(offset as usize).write(1);
     }
 
     // Up until now we've been using the stack pointer from the bootloader.
-    // Allocate us a stack pointer and enable it.
-    let sp = (memory_pages as u32 & !(4096 - 1)) - 4;
+    // Allocate us a stack pointer directly below the memory page tracker,
+    // and enable it.
+    let sp = (runtime_page_tracker as u32 & !(4096 - 1)) - 4;
     set_sp(sp);
 
     loop {}

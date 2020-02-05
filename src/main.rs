@@ -3,6 +3,13 @@
 
 use core::{mem, ptr};
 pub type XousPid = u8;
+const PAGE_SIZE: u32 = 4096;
+
+/// A single RISC-V page table entry.  In order to resolve an address,
+/// we need two entries: the top level, followed by the lower level.
+struct PageTable {
+    entries: [u32; 1024],
+}
 
 macro_rules! make_type {
     ($fcc:expr) => {{
@@ -15,6 +22,7 @@ macro_rules! make_type {
 extern "C" {
     /// Set the stack pointer to the given address.
     fn set_sp(sp: u32);
+    fn set_satp(satp: u32);
 }
 
 pub unsafe fn bzero<T>(mut sbss: *mut T, ebss: *mut T)
@@ -110,7 +118,7 @@ pub unsafe extern "C" fn stage1(arg_buffer: *const u8, _signature: u32) -> ! {
         let _region_start = regions_start.add(region_offset + 0).read();
         let region_length = regions_start.add(region_offset + 1).read();
         let _region_name = regions_start.add(region_offset + 2).read();
-        mem_page_count += region_length * mem::size_of::<XousPid>() as u32 / 4096;
+        mem_page_count += region_length * mem::size_of::<XousPid>() as u32 / PAGE_SIZE;
     }
     // Ensure we have a number of pages divisible by 4, since everything is done
     // with 32-bit math.
@@ -136,7 +144,7 @@ pub unsafe extern "C" fn stage1(arg_buffer: *const u8, _signature: u32) -> ! {
 
     // Mark these pages as being owned by PID1.
     // Add an extra page to store the stack pointer, also owned by PID1.
-    for offset in (sram_len - args_size - mem_page_count - 1) / 4096..(sram_len / 4096) {
+    for offset in (sram_len - args_size - mem_page_count - 1) / PAGE_SIZE..(sram_len / PAGE_SIZE) {
         (runtime_page_tracker as *mut XousPid)
             .add(offset as usize)
             .write(1);
@@ -145,7 +153,7 @@ pub unsafe extern "C" fn stage1(arg_buffer: *const u8, _signature: u32) -> ! {
     // Up until now we've been using the stack pointer from the bootloader.
     // Allocate us a stack pointer directly below the memory page tracker,
     // and enable it.
-    let sp = (runtime_page_tracker as u32 & !(4096 - 1)) - 4;
+    let sp = (runtime_page_tracker as u32 & !(PAGE_SIZE - 1)) - 4;
     set_sp(sp);
 
     stage2(
@@ -158,6 +166,83 @@ pub unsafe extern "C" fn stage1(arg_buffer: *const u8, _signature: u32) -> ! {
     );
 }
 
+struct Allocator {
+    next_page_offset: u32,
+    runtime_page_tracker: *mut XousPid,
+    sram_start: *mut u8,
+}
+
+impl Allocator {
+    /// Zero-alloc a new page, mark it as owned by PID1, and return it.
+    /// Decrement the `next_page_offset` (npo) variable by one page.
+    pub fn alloc(&mut self) -> *mut u32 {
+        self.next_page_offset = self.next_page_offset - PAGE_SIZE as u32;
+        unsafe {
+            // Grab the page address and zero it out
+            let pg = self.sram_start.add(self.next_page_offset as usize);
+            bzero(pg as *mut u32, pg.add(PAGE_SIZE as usize) as *mut u32);
+
+            // Mark this page as in-use by PID1
+            self.runtime_page_tracker
+                .add((self.next_page_offset / PAGE_SIZE) as usize)
+                .write_volatile(1);
+
+            // Return the address
+            pg as *mut u32
+        }
+    }
+
+    /// Map the given page to the specified process table.  If necessary,
+    /// allocate a new page.
+    ///
+    /// # Panics
+    ///
+    /// * If you try to map a page twice
+    pub fn map_page(
+        &mut self,
+        root: &mut PageTable,
+        phys: u32,
+        virt: u32,
+    ) {
+        let ppn1 = (phys >> 22) & ((1 << 12) - 1);
+        let ppn0 = (phys >> 12) & ((1 << 10) - 1);
+        let ppo = (phys >> 0) & ((1 << 12) - 1);
+
+        let vpn1 = (virt >> 22) & ((1 << 10) - 1);
+        let vpn0 = (virt >> 12) & ((1 << 10) - 1);
+        let vpo = (virt >> 0) & ((1 << 12) - 1);
+
+        assert!(ppn1 < 4096);
+        assert!(ppn0 < 1024);
+        assert!(ppo < 4096);
+        assert!(vpn1 < 1024);
+        assert!(vpn0 < 1024);
+        assert!(vpo < 4096);
+
+        let ref mut l1_pt = root.entries;
+
+        // Allocate a new level 1 pagetable entry if one doesn't exist.
+        if l1_pt[vpn1 as usize] & 1 == 0 {
+            let new_addr = self.alloc() as u32;
+
+            // Mark this entry as a leaf node (WRX as 0), and indicate
+            // it is a valid page by setting "V".
+            let ppn = new_addr >> 12;
+            l1_pt[vpn1 as usize] = (ppn << 10) | 1;
+        }
+
+        let l0_pt_idx =
+            unsafe { &mut (*(((l1_pt[vpn1 as usize] << 2) & !((1 << 12) - 1)) as *mut PageTable)) };
+        let ref mut l0_pt = l0_pt_idx.entries;
+
+        // Allocate a new level 0 pagetable entry if one doesn't exist.
+        if l0_pt[vpn0 as usize] & 1 != 0 {
+            panic!("Page already allocated!");
+        }
+        l0_pt[vpn0 as usize] = (ppn1 << 20) | (ppn0 << 10) | 1 | 0xe | 0xd0;
+    }
+}
+
 /// Stage 2 bootloader
 /// This sets up the MMU and loads both PID1 and the kernel into RAM.
 fn stage2(
@@ -168,40 +253,93 @@ fn stage2(
     sram_start: *mut u8,
     sram_len: u32,
 ) -> ! {
-    let mut byte_offset = 0;
-
     // next page offset is in units of bytes.
     // The offset is from the start of SRAM.
-    let mut next_page_offset = (sram_len - runtime_args_len - runtime_page_tracker_len - 4096) & !(4096-1);
+    let next_page_offset =
+        (sram_len - runtime_args_len - runtime_page_tracker_len - PAGE_SIZE) & !(PAGE_SIZE - 1);
+    let sp_page = next_page_offset;
 
-    /// Zero-alloc a new page, mark it as owned by PID1, and return it.
-    /// Decrement the `next_page_offset` (npo) variable by one page.
-    fn alloc_page(
-        npo: &mut u32,
-        runtime_page_tracker: *mut XousPid,
-        sram_start: *mut u8,
-    ) -> *mut u32 {
-        *npo = *npo - 4096;
-        unsafe {
-            // Grab the page address and zero it out
-            let pg = sram_start.add(*npo as usize);
-            bzero(pg as *mut u32, pg.add(4096) as *mut u32);
+    let mut allocator = Allocator {
+        next_page_offset,
+        runtime_page_tracker,
+        sram_start,
+    };
 
-            // Mark this page as in-use by PID1
-            runtime_page_tracker
-                .add(*npo as usize / 4096)
-                .write_volatile(1);
+    let pid1_satp = allocator.alloc() as u32;
+    unsafe { set_satp((pid1_satp >> 10) | 0x80000000 | (1<<22) ) };
+    let pid1_satp = unsafe { &mut *(pid1_satp as *mut PageTable) };
 
-            // Return the address
-            pg as *mut u32
+    // Loop through the kernel args and copy the kernel and PID1
+    let mut args_offset = 0;
+    let mut pid1_seen = false;
+    let mut xkrn_seen = false;
+    let mut kernel_entrypoint = 0;
+    let mut pid1_entrypoint = 0;
+    while args_offset < runtime_args_len as usize {
+        let (tag_name, _crc, size) =
+            read_next_tag(runtime_args, &mut args_offset).expect("couldn't read next tag");
+        if tag_name == make_type!("PID1") {
+            assert!(size == 28, "invalid PID1 size");
+            assert!(!pid1_seen, "pid1 appears twice");
+            let pid1_base = unsafe { runtime_args.add(args_offset) as *mut u32 };
+            let load_offset = unsafe { pid1_base.add(0).read() };
+            let load_size = unsafe { pid1_base.add(1).read() };
+            let text_offset = unsafe { pid1_base.add(2).read() };
+            let data_offset = unsafe { pid1_base.add(3).read() };
+            let data_size = unsafe { pid1_base.add(4).read() };
+            pid1_entrypoint = unsafe { pid1_base.add(5).read() };
+            let stack = unsafe { pid1_base.add(6).read() };
+            allocator.map_page(pid1_satp, sp_page, stack);
+            assert!((load_offset & (PAGE_SIZE - 1)) == 0);
+            assert!((data_offset & (PAGE_SIZE - 1)) == 0);
+            for offset in (0..load_size).step_by(PAGE_SIZE as usize) {
+                let page_addr = allocator.alloc();
+                allocator.map_page(pid1_satp, page_addr as u32, text_offset + offset);
+                let mut to_copy = PAGE_SIZE;
+                if load_size - offset < to_copy {
+                    to_copy = load_size - offset;
+                }
+                unsafe { memcpy(page_addr, (load_offset + offset) as *mut u32, to_copy as usize) };
+            }
+
+            for offset in (0..data_size).step_by(PAGE_SIZE as usize) {
+                let page_addr = allocator.alloc();
+                allocator.map_page(pid1_satp, page_addr as u32, data_offset + offset);
+            }
+
+            pid1_seen = true;
+        }
+        if tag_name == make_type!("XKRN") {
+            assert!(size == 24, "invalid XKRN size");
+            assert!(!xkrn_seen, "xkrn appears twice");
+            let xkrn_base = unsafe { runtime_args.add(args_offset) as *mut u32 };
+            let load_offset = unsafe { xkrn_base.add(0).read() };
+            let load_size = unsafe { xkrn_base.add(1).read() };
+            let text_offset = unsafe { xkrn_base.add(2).read() };
+            let data_offset = unsafe { xkrn_base.add(3).read() };
+            let data_size = unsafe { xkrn_base.add(4).read() };
+            kernel_entrypoint = unsafe { xkrn_base.add(5).read() };
+
+            assert!((load_offset & (PAGE_SIZE - 1)) == 0);
+            assert!((data_offset & (PAGE_SIZE - 1)) == 0);
+            for offset in (0..load_size).step_by(PAGE_SIZE as usize) {
+                let page_addr = allocator.alloc();
+                allocator.map_page(pid1_satp, page_addr as u32, text_offset + offset);
+                let mut to_copy = PAGE_SIZE;
+                if load_size - offset < to_copy {
+                    to_copy = load_size - offset;
+                }
+                unsafe { memcpy(page_addr, (load_offset + offset) as *mut u32, to_copy as usize) };
+            }
+
+            for offset in (0..data_size).step_by(PAGE_SIZE as usize) {
+                let page_addr = allocator.alloc();
+                allocator.map_page(pid1_satp, page_addr as u32, data_offset + offset);
+            }
+
+            xkrn_seen = true;
         }
     }
 
-    let pid1_satp = alloc_page(&mut next_page_offset, runtime_page_tracker, sram_start);
-    let pid1_stack = alloc_page(&mut next_page_offset, runtime_page_tracker, sram_start);
-
-    loop {
-        // let (tag_name, _crc, size) =
-        //     read_next_tag(runtime_args, &mut byte_offset).expect("couldn't read next tag");
-    }
+    loop {}
 }

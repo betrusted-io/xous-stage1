@@ -13,3 +13,8 @@ abort:
 set_sp:
     add sp,a0,zero
     ret
+
+.global set_satp
+set_satp:
+    csrw satp, a0
+    ret

@@ -5,6 +5,7 @@ _start:
     li a0, 0x20600000
     j stage1
 
+// This is used only in debug mode.
 .global abort
 abort:
     j abort

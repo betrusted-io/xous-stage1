@@ -25,6 +25,9 @@ struct BootConfig {
     /// Base load address.  Defaults to the start of the args block
     base_addr: *const u32,
 
+    /// Where the tagged args lsit starts in RAM.
+    args_start: *const u8,
+
     /// The size of the kernel args tagged data
     args_size: u32,
 
@@ -45,6 +48,12 @@ struct BootConfig {
     /// indicates the number of pages at the end of RAM that
     /// will need to be owned by PID1.
     init_size: u32,
+
+    runtime_page_tracker: *mut XousPid,
+    runtime_page_tracker_len: u32,
+
+    system_services: *mut SystemServices,
+    process_offset: u32,
 }
 
 /// A single RISC-V page table entry.  In order to resolve an address,
@@ -319,8 +328,8 @@ fn read_initial_config(b8: *const u8, cfg: &mut BootConfig) {
         if tag_name == make_type!("MBLK") {
             cfg.regions_start = unsafe { b8.add(byte_offset) as *mut u32 };
             cfg.regions_size = size;
-            cfg.sram_start = unsafe { (b8.add(byte_offset + 4) as *mut u32).read() } as *mut u32;
-            cfg.sram_size = unsafe { (b8.add(byte_offset + 8) as *mut u32).read() };
+            cfg.sram_start = unsafe { (b8.add(byte_offset + 0) as *mut u32).read() } as *mut u32;
+            cfg.sram_size = unsafe { (b8.add(byte_offset + 4) as *mut u32).read() };
         } else if tag_name == make_type!("Bflg") {
             let boot_flags = unsafe { (b8.add(byte_offset) as *mut u32).read() };
             if boot_flags & 1 != 0 {
@@ -404,7 +413,7 @@ impl BootConfig {
 
 /// Allocate and initialize memory regions.
 /// Returns a pointer to the start of the memory region.
-fn allocate_regions(cfg: &mut BootConfig) -> (*mut u32, u32) {
+fn allocate_regions(cfg: &mut BootConfig) -> (*mut XousPid, u32) {
     let top = cfg.get_top();
     // Number of individual pages in the system
     let mut runtime_page_tracker_len = 0;
@@ -425,30 +434,37 @@ fn allocate_regions(cfg: &mut BootConfig) -> (*mut u32, u32) {
     }
 
     cfg.init_size += runtime_page_tracker_len;
+    cfg.runtime_page_tracker = runtime_page_tracker as *mut XousPid;
+    cfg.runtime_page_tracker_len = runtime_page_tracker_len;
 
-    (runtime_page_tracker, runtime_page_tracker_len)
+    (runtime_page_tracker as *mut XousPid, runtime_page_tracker_len)
 }
 
-fn allocate_processes(cfg: &mut BootConfig) -> *mut u32 {
-    let top = cfg.get_top();
-    // Allocate the process table
+fn allocate_processes(cfg: &mut BootConfig) -> *mut SystemServices {
     let runtime_process_table_len = mem::size_of::<SystemServices>() as u32;
-    let runtime_process_table = unsafe { top.sub(runtime_process_table_len as usize / 4) };
+    // Allocate the process table
+    cfg.init_size += runtime_process_table_len;
+    let runtime_process_table = cfg.get_top();
     unsafe {
         bzero(
             runtime_process_table,
             runtime_process_table.add((runtime_process_table_len / 4) as usize),
         );
     }
-
-    cfg.init_size += runtime_process_table_len;
-
-    runtime_process_table
+    runtime_process_table as *mut SystemServices
 }
 
-fn copy_args(cfg: &mut BootConfig, arg_buffer: *const u8, top: *mut u32) -> *const u8 {
+fn allocate_config(cfg: &mut BootConfig) -> &mut BootConfig {
+    cfg.init_size += mem::size_of::<BootConfig>() as u32;
+    let top = cfg.get_top();
+    unsafe { memcpy(top, cfg as *const BootConfig as *const u32, mem::size_of::<BootConfig>()) };
+    unsafe { &mut (*(top as *mut BootConfig)) }
+}
+
+fn copy_args(cfg: &mut BootConfig, arg_buffer: *const u8) {
     // Copy the args list to target RAM
-    let runtime_arg_buffer = unsafe { top.sub(cfg.args_size as usize / 4) };
+    cfg.init_size += cfg.args_size;
+    let runtime_arg_buffer = cfg.get_top();
     unsafe {
         memcpy(
             runtime_arg_buffer,
@@ -456,12 +472,10 @@ fn copy_args(cfg: &mut BootConfig, arg_buffer: *const u8, top: *mut u32) -> *con
             cfg.args_size as usize,
         )
     };
-    cfg.init_size += cfg.args_size;
-
-    runtime_arg_buffer as *const u8
+    cfg.args_start = runtime_arg_buffer as *const u8;
 }
 
-fn stage1(mut arg_buffer: *const u8, _signature: u32) -> ! {
+fn stage1(arg_buffer: *const u8, _signature: u32) -> ! {
     let mut cfg = BootConfig {
         no_copy: false,
         base_addr: arg_buffer as *const u32,
@@ -469,21 +483,29 @@ fn stage1(mut arg_buffer: *const u8, _signature: u32) -> ! {
         regions_size: 0,
         sram_start: 0 as *mut u32,
         sram_size: 0,
+        args_start: 0 as *const u8,
         args_size: 0,
         init_size: 0,
+        runtime_page_tracker: 0 as *mut XousPid,
+        runtime_page_tracker_len: 0,
+        system_services: 0 as *mut SystemServices,
+        process_offset: 0,
     };
     read_initial_config(arg_buffer, &mut cfg);
 
     // The first region is defined as being "main RAM", which will be used
     // to keep track of allocations.
-    let (runtime_page_tracker, runtime_page_tracker_len) = allocate_regions(&mut cfg);
+    allocate_regions(&mut cfg);
 
     // Processes are also stored in RAM
-    let runtime_process_table = allocate_processes(&mut cfg);
+    cfg.system_services = allocate_processes(&mut cfg);
+
+    // Switch from using our stack-allocated config to a heap-allocated config.
+    let mut cfg = allocate_config(&mut cfg);
 
     // Copy the arguments, if requested
     if !cfg.no_copy {
-        arg_buffer = copy_args(&mut cfg, arg_buffer, runtime_process_table);
+        copy_args(&mut cfg, arg_buffer);
     }
 
     // All further allocations must be page-aligned.
@@ -494,9 +516,9 @@ fn stage1(mut arg_buffer: *const u8, _signature: u32) -> ! {
     // Allocate us a stack pointer directly below the memory page tracker,
     // and enable it.
     let sp = unsafe { cfg.get_top().sub(1) };
-    cfg.init_size = (cfg.init_size + 4096 - 1) & !(4096 - 1);
+    cfg.init_size += PAGE_SIZE;
 
-    let process_offset = cfg.init_size;
+    cfg.process_offset = cfg.init_size;
 
     // Copy the processes to RAM, if requested.
     if !cfg.no_copy {
@@ -508,64 +530,48 @@ fn stage1(mut arg_buffer: *const u8, _signature: u32) -> ! {
     // will require us to transfer ownership in `stage3`
     for i in 0..(cfg.init_size / PAGE_SIZE) {
         unsafe {
-            (runtime_page_tracker as *mut XousPid)
-                .add((runtime_page_tracker_len - i - 1) as usize)
+            (cfg.runtime_page_tracker as *mut XousPid)
+                .add((cfg.runtime_page_tracker_len - i - 1) as usize)
                 .write_volatile(1)
         };
     }
 
-    let mut runtime_process_table = unsafe { &mut *(runtime_process_table as *mut SystemServices) };
-
     unsafe { set_sp(sp as u32) };
-    stage2(
-        arg_buffer,
-        runtime_page_tracker as *mut XousPid,
-        &mut runtime_process_table,
-        cfg.sram_start as *mut u8,
-        cfg.sram_size,
-        cfg.init_size,
-        process_offset,
-    );
+    stage2(&mut cfg);
 }
 
 /// Stage 2 bootloader
 /// This sets up the MMU and loads both PID1 and the kernel into RAM.
-fn stage2(
-    runtime_args: *const u8,
-    runtime_page_tracker: *mut XousPid,
-    runtime_process_table: &mut SystemServices,
-    sram_start: *mut u8,
-    sram_len: u32,
-    reserved_bytes: u32,
-    process_offset: u32,
-) -> ! {
+fn stage2(cfg: &mut BootConfig) -> ! {
     let mut allocator = Allocator {
-        runtime_page_tracker,
-        sram_start,
-        next_page_offset: sram_len - reserved_bytes,
+        runtime_page_tracker: cfg.runtime_page_tracker as *mut XousPid,
+        sram_start: cfg.sram_start as *mut u8,
+        next_page_offset: cfg.sram_size - cfg.init_size,
+        regions_size: cfg.regions_size,
+        regions_start: cfg.regions_start,
     };
+    let mut system_services = unsafe { &mut (*cfg.system_services) };
 
     // Loop through the kernel args and copy the kernel and PID1
     let mut args_offset = 0;
     let mut xkrn_seen = false;
     let mut kernel_entrypoint = 0;
-    let runtime_args_len = unsafe { (runtime_args as *const u32).add(4).read() };
 
-    let mut process_offset = sram_len - process_offset;
+    let mut process_offset = cfg.sram_size - cfg.process_offset;
 
-    while args_offset < runtime_args_len as usize {
+    while args_offset < cfg.args_size as usize {
         let (tag_name, _crc, size) =
-            read_next_tag(runtime_args, &mut args_offset).expect("couldn't read next tag");
+            read_next_tag(cfg.args_start, &mut args_offset).expect("couldn't read next tag");
 
         if tag_name == make_type!("Init") {
-            let init = unsafe { &*(runtime_args.add(args_offset) as *const ProgramDescription) };
-            init.load(&mut allocator, process_offset, false, runtime_process_table);
+            let init = unsafe { &*(cfg.args_start.add(args_offset) as *const ProgramDescription) };
+            init.load(&mut allocator, process_offset, false, &mut system_services);
             let load_size_rounded = (init.load_size + 4096 - 1) & !(4096 - 1);
             process_offset -= load_size_rounded;
         } else if tag_name == make_type!("XKRN") {
-            let xkrn = unsafe { &*(runtime_args.add(args_offset) as *const ProgramDescription) };
+            let xkrn = unsafe { &*(cfg.args_start.add(args_offset) as *const ProgramDescription) };
             kernel_entrypoint =
-                xkrn.load(&mut allocator, process_offset, true, runtime_process_table);
+                xkrn.load(&mut allocator, process_offset, true, &mut system_services);
             let load_size_rounded = (xkrn.load_size + 4096 - 1) & !(4096 - 1);
             process_offset -= load_size_rounded;
             xkrn_seen = true;

@@ -3,6 +3,7 @@
 
 _start:
     li a0, 0x20600000
+    li sp, 0x40100000
     j stage1
 
 // This is used only in debug mode.

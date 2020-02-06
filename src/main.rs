@@ -49,10 +49,19 @@ struct BootConfig {
     /// will need to be owned by PID1.
     init_size: u32,
 
+    /// This structure keeps track of which pages are owned
+    /// and which are free. A PID of `0` indicates it's free.
     runtime_page_tracker: *mut XousPid,
+
+    /// The size (in bytes) of the `runtime_page_tracker`.
     runtime_page_tracker_len: u32,
 
+    /// A list of system services.  Effectively, this contains
+    /// the process table.
     system_services: *mut SystemServices,
+
+    /// If `no_copy` is not set, this is the offset of the first
+    /// page allocated to processes.
     process_offset: u32,
 }
 
@@ -544,7 +553,7 @@ fn stage1(arg_buffer: *const u8, _signature: u32) -> ! {
 /// This sets up the MMU and loads both PID1 and the kernel into RAM.
 fn stage2(cfg: &mut BootConfig) -> ! {
     let mut allocator = Allocator {
-        runtime_page_tracker: cfg.runtime_page_tracker as *mut XousPid,
+        runtime_page_tracker: cfg.runtime_page_tracker,
         sram_start: cfg.sram_start as *mut u8,
         next_page_offset: cfg.sram_size - cfg.init_size,
         regions_size: cfg.regions_size,
@@ -554,11 +563,11 @@ fn stage2(cfg: &mut BootConfig) -> ! {
 
     // Loop through the kernel args and copy the kernel and PID1
     let mut args_offset = 0;
-    let mut xkrn_seen = false;
-    let mut kernel_entrypoint = 0;
 
     let mut process_offset = cfg.sram_size - cfg.process_offset;
 
+    // Go through all Init processes and the kernel, setting up their
+    // page tables and mapping memory to them.
     while args_offset < cfg.args_size as usize {
         let (tag_name, _crc, size) =
             read_next_tag(cfg.args_start, &mut args_offset).expect("couldn't read next tag");
@@ -570,14 +579,14 @@ fn stage2(cfg: &mut BootConfig) -> ! {
             process_offset -= load_size_rounded;
         } else if tag_name == make_type!("XKRN") {
             let xkrn = unsafe { &*(cfg.args_start.add(args_offset) as *const ProgramDescription) };
-            kernel_entrypoint =
-                xkrn.load(&mut allocator, process_offset, true, &mut system_services);
+            xkrn.load(&mut allocator, process_offset, true, &mut system_services);
             let load_size_rounded = (xkrn.load_size + 4096 - 1) & !(4096 - 1);
             process_offset -= load_size_rounded;
-            xkrn_seen = true;
         }
         args_offset += size as usize;
     }
 
+    // Activate the kernel as the current process, and jump
+    // into Supervisor mode.
     loop {}
 }

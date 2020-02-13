@@ -3,8 +3,14 @@
 
 _start:
     li a0, 0x20600000
-    li sp, 0x40100000
-    j stage1
+    // Place the stack pointer at the end of RAM
+    lw t0, 16(a0) // SRAM start
+    lw t1, 20(a0) // SRAM length
+
+    # Point the stack pointer at the end of RAM
+    add sp, t0, t1
+
+    j rust_entry
 
 // This is used only in debug mode.
 .global abort

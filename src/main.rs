@@ -1,10 +1,14 @@
 #![no_std]
 #![no_main]
 
+mod args;
+use args::KernelArguments;
+
 use core::{mem, ptr};
 
 pub type XousPid = u8;
 const PAGE_SIZE: u32 = 4096;
+const STACK_OFFSET: u32 = 0xdffffffc;
 const MAX_PROCESS_COUNT: usize = 256;
 
 const FLG_VALID: u32 = 0x1;
@@ -40,10 +44,7 @@ struct BootConfig {
     base_addr: *const u32,
 
     /// Where the tagged args lsit starts in RAM.
-    args_start: *const u8,
-
-    /// The size of the kernel args tagged data
-    args_size: u32,
+    args: Option<&'static KernelArguments>,
 
     /// The start of the memory region listing
     regions_start: *mut u32,
@@ -94,6 +95,9 @@ struct Process {
 
     /// The last address of the program counter
     pc: u32,
+
+    /// Padding to make it a multiple of 4 bytes
+    _unused: u32,
 }
 
 struct SystemServices {
@@ -123,11 +127,6 @@ struct ProgramDescription {
 
     /// Virtual address entry point.
     entrypoint: u32,
-
-    /// Virtual address of the top of the stack pointer.  This process will
-    /// get one page allocated.  Additional pages will be allocated as stack
-    /// grows and faults occur.
-    stack_offset: u32,
 }
 
 extern "C" {
@@ -169,7 +168,7 @@ impl ProgramDescription {
 
             // Allocate a page for stack
             let sp_page = allocator.alloc() as u32;
-            allocator.map_page(satp, sp_page, self.stack_offset, FLG_W | FLG_R);
+            allocator.map_page(satp, sp_page, STACK_OFFSET, FLG_W | FLG_R);
             allocator.change_owner(pid as XousPid, sp_page);
 
             assert!((self.load_offset & (PAGE_SIZE - 1)) == 0);
@@ -193,6 +192,10 @@ impl ProgramDescription {
             processes.processes[pid].pc = self.entrypoint;
             processes.processes[pid].state = 1;
 
+            if is_kernel {
+                allocator.map_page(satp, 0xE0002000, 0xF0002000, FLG_W | FLG_R);
+                // allocator.change_owner(pid as XousPid, load_offset + offset);
+            }
             return self.entrypoint;
         }
         panic!("no free PID found");
@@ -222,77 +225,50 @@ where
     }
 }
 
-fn read_next_tag(b8: *const u8, byte_offset: &mut usize) -> Result<(u32, u32, u32), ()> {
-    let tag_name = u32::from_le(unsafe { (b8 as *mut u32).add(*byte_offset / 4).read() }) as u32;
-    *byte_offset += 4;
-    let crc = u16::from_le(unsafe { (b8 as *mut u16).add(*byte_offset / 2).read() }) as u32;
-    *byte_offset += 2;
-    let size = u16::from_le(unsafe { (b8 as *mut u16).add(*byte_offset / 2).read() }) as u32 * 4;
-    *byte_offset += 2;
-    Ok((tag_name, crc, size))
-}
-
-fn read_initial_config(b8: *const u8, cfg: &mut BootConfig) {
-    let mut byte_offset = 0;
-
-    let (tag_name, _crc, size) =
-        read_next_tag(b8, &mut byte_offset).expect("couldn't read initial tag");
-    if tag_name != make_type!("XArg") || size != 20 {
+fn read_initial_config(args: &KernelArguments, cfg: &mut BootConfig) {
+    let mut i = args.iter();
+    let xarg = i.next().expect("couldn't read initial tag");
+    if xarg.name != make_type!("XArg") || xarg.size != 20 {
         panic!("XArg wasn't first tag, or was invalid size");
     }
-    let total_bytes = unsafe { (b8 as *const usize).add(byte_offset / 4).read() } * 4;
-    cfg.sram_start = unsafe { (b8.add(byte_offset + 8) as *mut u32).read() } as *mut u32;
-    cfg.sram_size = unsafe { (b8.add(byte_offset + 12) as *mut u32).read() };
-    byte_offset += size as usize;
+    cfg.sram_start = xarg.data[1] as *mut u32;
+    cfg.sram_size = xarg.data[2];
 
-    cfg.args_size = total_bytes as u32;
     let mut kernel_seen = false;
     let mut init_seen = false;
 
-    while byte_offset < total_bytes {
-        let (tag_name, _crc, size) =
-            read_next_tag(b8, &mut byte_offset).expect("couldn't read next tag");
-        if tag_name == make_type!("MBLK") {
-            cfg.regions_start = unsafe { b8.add(byte_offset) as *mut u32 };
-            cfg.regions_size = size;
-        } else if tag_name == make_type!("Bflg") {
-            let boot_flags = unsafe { (b8.add(byte_offset) as *mut u32).read() };
+    for tag in i {
+        if tag.name == make_type!("MREx") {
+            cfg.regions_start = tag.data[0] as *mut u32;
+            cfg.regions_size = tag.size;
+        } else if tag.name == make_type!("Bflg") {
+            let boot_flags = tag.data[0];
             if boot_flags & 1 != 0 {
                 cfg.no_copy = true;
             }
             if boot_flags & 2 != 0 {
                 cfg.base_addr = 0 as *const u32;
             }
-        } else if tag_name == make_type!("XKRN") {
+        } else if tag.name == make_type!("XKrn") {
             assert!(!kernel_seen, "kernel appears twice");
-            assert!(size == 28, "invalid XKRN size");
+            assert!(tag.size as usize == mem::size_of::<ProgramDescription>(), "invalid XKrn size");
             kernel_seen = true;
-        } else if tag_name == make_type!("Init") {
-            assert!(size == 28, "invalid Init size");
+        } else if tag.name == make_type!("Init") {
+            assert!(tag.size as usize == mem::size_of::<ProgramDescription>(), "invalid Init size");
             init_seen = true;
         }
-        byte_offset += size as usize;
     }
 
     assert!(kernel_seen, "no kernel definition");
     assert!(init_seen, "no initial programs found");
-    if byte_offset > total_bytes {
-        panic!(
-            "exceeded total bytes ({}) with byte_offset of {}",
-            total_bytes, byte_offset
-        );
-    }
 }
 
-fn copy_processes(cfg: &mut BootConfig, args: *const u8) {
-    let mut byte_offset = 0;
+fn copy_processes(cfg: &mut BootConfig, args: &KernelArguments) {
     let mut top = cfg.get_top();
 
-    while byte_offset < cfg.args_size as usize {
-        let (tag_name, _crc, size) =
-            read_next_tag(args, &mut byte_offset).expect("couldn't read next tag");
-        if tag_name == make_type!("XKRN") || tag_name == make_type!("Init") {
-            let prog = unsafe { &*(args.add(byte_offset) as *const ProgramDescription) };
+    for tag in args.iter() {
+        if tag.name == make_type!("XKrn") || tag.name == make_type!("Init") {
+            let prog = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
 
             // Round it off to a page boundary
             let load_size_rounded = (prog.load_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
@@ -307,23 +283,7 @@ fn copy_processes(cfg: &mut BootConfig, args: *const u8) {
                 )
             };
         }
-        byte_offset += size as usize;
     }
-
-    if byte_offset > cfg.args_size as usize {
-        panic!(
-            "exceeded total bytes ({}) with byte_offset of {}",
-            cfg.args_size, byte_offset
-        );
-    }
-}
-
-/// Stage 1 Bootloader
-/// This makes the program self-sufficient by setting up memory page assignment
-/// and copying the arguments to RAM
-#[export_name = "rust_entry"]
-pub unsafe extern "C" fn rust_entry(arg_buffer: *const u8, signature: u32) -> ! {
-    stage1(arg_buffer, signature);
 }
 
 impl BootConfig {
@@ -486,40 +446,48 @@ fn allocate_config(cfg: &mut BootConfig) -> &mut BootConfig {
     unsafe { &mut (*(top as *mut BootConfig)) }
 }
 
-fn copy_args(cfg: &mut BootConfig, arg_buffer: *const u8) {
+fn copy_args(cfg: &mut BootConfig, args: &KernelArguments) {
     // Copy the args list to target RAM
-    cfg.init_size += cfg.args_size;
+    cfg.init_size += args.size();
     let runtime_arg_buffer = cfg.get_top();
     unsafe {
         memcpy(
             runtime_arg_buffer,
-            arg_buffer as *mut u32,
-            cfg.args_size as usize,
+            args.base,
+            args.size() as usize,
         )
     };
     // TODO: Patch up regions_start
-    cfg.args_start = runtime_arg_buffer as *const u8;
+    cfg.args = unsafe { Some(&*(runtime_arg_buffer as *const KernelArguments)) };
 }
 
-fn stage1(arg_buffer: *const u8, _signature: u32) -> ! {
+/// Stage 1 Bootloader
+/// This makes the program self-sufficient by setting up memory page assignment
+/// and copying the arguments to RAM.
+/// Assume the bootloader has already set up the stack to point to the end of RAM.
+#[export_name = "rust_entry"]
+pub unsafe extern "C" fn rust_entry(arg_buffer: *const u32, signature: u32) -> ! {
+    stage1(KernelArguments::new(arg_buffer), signature);
+}
+
+fn stage1(args: KernelArguments, _signature: u32) -> ! {
     // Store the initial boot config on the stack.  We don't know
     // where in heap this memory will go.
     let mut cfg = BootConfig {
         no_copy: false,
-        base_addr: arg_buffer as *const u32,
+        base_addr: 0 as *const u32,
         regions_start: 0 as *mut u32,
         regions_size: 0,
         sram_start: 0 as *mut u32,
         sram_size: 0,
-        args_start: 0 as *const u8,
-        args_size: 0,
+        args: None,
         init_size: 0,
         runtime_page_tracker: 0 as *mut XousPid,
         runtime_page_tracker_len: 0,
         system_services: 0 as *mut SystemServices,
         process_offset: 0,
     };
-    read_initial_config(arg_buffer, &mut cfg);
+    read_initial_config(&args, &mut cfg);
 
     // Allocate a stack pointer.
     // Allocate us a stack pointer directly below the memory page tracker,
@@ -539,7 +507,7 @@ fn stage1(arg_buffer: *const u8, _signature: u32) -> ! {
 
     // Copy the arguments, if requested
     if !cfg.no_copy {
-        copy_args(&mut cfg, arg_buffer);
+        copy_args(&mut cfg, &args);
     }
 
     // All further allocations must be page-aligned.
@@ -549,7 +517,7 @@ fn stage1(arg_buffer: *const u8, _signature: u32) -> ! {
 
     // Copy the processes to RAM, if requested.
     if !cfg.no_copy {
-        copy_processes(&mut cfg, arg_buffer);
+        copy_processes(&mut cfg, &args);
     }
 
     // Mark all pages as in-use by the kernel.
@@ -563,7 +531,7 @@ fn stage1(arg_buffer: *const u8, _signature: u32) -> ! {
         };
     }
 
-    unsafe { set_sp(sp as u32) };
+    // unsafe { set_sp(sp as u32) };
     stage2(&mut cfg);
 }
 
@@ -572,33 +540,28 @@ fn stage1(arg_buffer: *const u8, _signature: u32) -> ! {
 fn stage2(cfg: &mut BootConfig) -> ! {
     let mut system_services = unsafe { &mut (*cfg.system_services) };
 
-    // Loop through the kernel args and copy the kernel and Init
-    let mut args_offset = 0;
-
     // This is the offset in RAM where programs are loaded from.
     let mut process_offset = cfg.sram_start as u32 + cfg.sram_size - cfg.process_offset;
 
     // Go through all Init processes and the kernel, setting up their
     // page tables and mapping memory to them.
-    while args_offset < cfg.args_size as usize {
-        let (tag_name, _crc, size) =
-            read_next_tag(cfg.args_start, &mut args_offset).expect("couldn't read next tag");
-
-        if tag_name == make_type!("Init") {
-            let init = unsafe { &*(cfg.args_start.add(args_offset) as *const ProgramDescription) };
+    for tag in cfg.args.unwrap().iter() {
+        if tag.name == make_type!("Init") {
+            let init = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
             init.load(cfg, process_offset, false, &mut system_services);
             let load_size_rounded = (init.load_size + 4096 - 1) & !(4096 - 1);
             process_offset -= load_size_rounded;
-        } else if tag_name == make_type!("XKRN") {
-            let xkrn = unsafe { &*(cfg.args_start.add(args_offset) as *const ProgramDescription) };
+        } else if tag.name == make_type!("XKrn") {
+            let xkrn = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
             xkrn.load(cfg, process_offset, true, &mut system_services);
             let load_size_rounded = (xkrn.load_size + 4096 - 1) & !(4096 - 1);
             process_offset -= load_size_rounded;
         }
-        args_offset += size as usize;
     }
 
-    // Activate the kernel as the current process, and jump
-    // into Supervisor mode.
     loop {}
+    // // Activate the kernel as the current process, and jump
+    // // into Supervisor mode.
+    // loop {
+    //     cfg.map_page(root: &mut PageTable, phys: u32, virt: u32, flags: u32) 
 }

@@ -168,7 +168,12 @@ impl ProgramDescription {
 
             // Allocate a page for stack
             let sp_page = allocator.alloc() as u32;
-            allocator.map_page(satp, sp_page, STACK_OFFSET & !(PAGE_SIZE - 1), flag_defaults);
+            allocator.map_page(
+                satp,
+                sp_page,
+                STACK_OFFSET & !(PAGE_SIZE - 1),
+                flag_defaults,
+            );
             allocator.change_owner(pid as XousPid, sp_page);
 
             assert!((self.text_offset & (PAGE_SIZE - 1)) == 0);
@@ -284,7 +289,6 @@ fn read_initial_config(args: &KernelArguments, cfg: &mut BootConfig) {
 }
 
 fn copy_processes(cfg: &mut BootConfig, args: &KernelArguments) {
-
     for tag in args.iter() {
         if tag.name == make_type!("XKrn") || tag.name == make_type!("Init") {
             let prog = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
@@ -560,7 +564,6 @@ fn stage1(args: KernelArguments, _signature: u32) -> ! {
         };
     }
 
-    // unsafe { set_sp(sp as u32) };
     stage2(&mut cfg);
 }
 

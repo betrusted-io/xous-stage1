@@ -88,7 +88,7 @@ struct PageTable {
 }
 
 struct Process {
-    /// The absolute MMU address.  If the high bit is not set, then this process is free.
+    /// The absolute MMU address.  If 0, then this process is free.
     satp: u32,
 
     /// Currently unused
@@ -153,9 +153,8 @@ impl ProgramDescription {
         let flag_defaults = FLG_R | FLG_W | if is_kernel { 0 } else { FLG_U };
         // Not a great algorithm!
         for pid in (initial_pid as usize)..processes.processes.len() {
-            // The upper bit indicates whether the SATP is valid or not.
-            // If this bit is set, then this process is allocated
-            if processes.processes[pid].satp & 0x80000000 != 0 {
+            // SATP must be nonzero
+            if processes.processes[pid].satp != 0 {
                 continue;
             }
 

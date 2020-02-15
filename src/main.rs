@@ -578,26 +578,77 @@ fn stage2(cfg: &mut BootConfig) -> ! {
 
     // Go through all Init processes and the kernel, setting up their
     // page tables and mapping memory to them.
+    let mut kernel_text_poffset = 0;
+    let mut kernel_text_voffset = 0;
+    let mut kernel_text_size = 0;
+    let mut kernel_data_poffset = 0;
+    let mut kernel_data_voffset = 0;
+    let mut kernel_data_size = 0;
     for tag in args.iter() {
         if tag.name == make_type!("Init") {
             let init = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
             let load_size_rounded = (init.load_size + 4096 - 1) & !(4096 - 1);
-            init.load(cfg, process_offset - load_size_rounded, false, &mut system_services);
+            init.load(
+                cfg,
+                process_offset - load_size_rounded,
+                false,
+                &mut system_services,
+            );
             process_offset -= load_size_rounded;
         } else if tag.name == make_type!("XKrn") {
             let xkrn = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
             let load_size_rounded = (xkrn.load_size + 4096 - 1) & !(4096 - 1);
-            xkrn.load(cfg, process_offset - load_size_rounded, true, &mut system_services);
+            kernel_text_size = load_size_rounded;
+            kernel_text_poffset = process_offset - kernel_text_size;
+            kernel_text_voffset = xkrn.text_offset;
+            kernel_data_size = xkrn.data_size;
+            kernel_data_poffset = kernel_text_poffset - kernel_data_size;
+            kernel_data_voffset = xkrn.data_offset;
+            xkrn.load(
+                cfg,
+                process_offset - load_size_rounded,
+                true,
+                &mut system_services,
+            );
             process_offset -= load_size_rounded;
         }
     }
 
-    // Map init structures to kernel space
-    let xkrn_satp = unsafe { &mut *(system_services.processes[0].satp as *mut PageTable) };
     let krn_struct_start = cfg.sram_start as u32 + cfg.sram_size - cfg.init_size;
-    for (off, addr) in (0..cfg.init_size).step_by(PAGE_SIZE as usize).enumerate()
-    {
-        cfg.map_page(xkrn_satp, krn_struct_start + addr, off as u32 * PAGE_SIZE + 0x00100000, FLG_R | FLG_W);
+    for pid in system_services.processes.iter() {
+        if pid.satp == 0 {
+            continue;
+        }
+        // Map kernel structures to each allocated process space
+        let satp = unsafe { &mut *(pid.satp as *mut PageTable) };
+        for (off, addr) in (0..cfg.init_size).step_by(PAGE_SIZE as usize).enumerate() {
+            cfg.map_page(
+                satp,
+                krn_struct_start + addr,
+                off as u32 * PAGE_SIZE + 0x00100000,
+                FLG_R | FLG_W,
+            );
+        }
+
+        // Map the kernel text section into every process
+        for offset in (0..kernel_text_size).step_by(PAGE_SIZE as usize) {
+            cfg.map_page(
+                satp,
+                kernel_text_poffset + offset,
+                kernel_text_voffset + offset,
+                FLG_R | FLG_W | FLG_X,
+            );
+        }
+
+        // Map the kernel data section into every process.
+        for offset in (0..kernel_data_size).step_by(PAGE_SIZE as usize) {
+            cfg.map_page(
+                satp,
+                kernel_data_poffset + offset,
+                kernel_data_voffset + offset,
+                FLG_R | FLG_W,
+            );
+        }
     }
 
     let arg_offset = cfg.args_base as u32 - krn_struct_start + 0x00100000;

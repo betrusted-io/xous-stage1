@@ -9,7 +9,7 @@ use core::{mem, ptr};
 pub type XousPid = u8;
 const PAGE_SIZE: u32 = 4096;
 const STACK_OFFSET: u32 = 0xdffffffc;
-const MAX_PROCESS_COUNT: usize = 256;
+const MAX_PROCESS_COUNT: usize = 255;
 
 const FLG_VALID: u32 = 0x1;
 const FLG_X: u32 = 0x8;
@@ -159,12 +159,18 @@ impl ProgramDescription {
             }
 
             // Allocate a page to handle the top-level memory translation
-            let satp = allocator.alloc() as u32;
-            allocator.change_owner(pid as XousPid, satp); // XXX Should this be owned by the kernel?
-            processes.processes[pid].satp = satp;
+            let satp_address = allocator.alloc() as u32;
+            allocator.change_owner(pid as XousPid, satp_address);
+            processes.processes[pid].satp = satp_address;
 
             // Turn the satp address into a pointer
-            let satp = unsafe { &mut *(satp as *mut PageTable) };
+            let satp = unsafe { &mut *(satp_address as *mut PageTable) };
+            allocator.map_page(
+                satp,
+                satp_address,
+                0x0020_0000,
+                FLG_R | FLG_W,
+            );
 
             // Allocate a page for stack
             let sp_page = allocator.alloc() as u32;
@@ -210,7 +216,7 @@ impl ProgramDescription {
             processes.processes[pid].pc = self.entrypoint;
             processes.processes[pid].state = 1;
 
-            // FIXME: Map the UART for the kernel
+            // XXX FIXME: Map the UART for the kernel
             if is_kernel {
                 allocator.map_page(satp, 0xE0002000, 0xF0002000, FLG_W | FLG_R);
                 allocator.change_owner(pid as XousPid, 0xE0002000);
@@ -398,10 +404,11 @@ impl BootConfig {
         assert!(vpo < 4096);
 
         let ref mut l1_pt = root.entries;
+        let mut new_addr = 0;
 
         // Allocate a new level 1 pagetable entry if one doesn't exist.
         if l1_pt[vpn1 as usize] & FLG_VALID == 0 {
-            let new_addr = self.alloc() as u32;
+            new_addr = self.alloc() as u32;
 
             // Mark this entry as a leaf node (WRX as 0), and indicate
             // it is a valid page by setting "V".
@@ -418,6 +425,18 @@ impl BootConfig {
         //     panic!("Page already allocated!");
         // }
         l0_pt[vpn0 as usize] = (ppn1 << 20) | (ppn0 << 10) | flags | FLG_VALID | FLG_D | FLG_A;
+
+        // If we had to allocate a level 1 pagetable entry, ensure that it's
+        // mapped into our address space.
+        // Offset it by one page so that the root page can live at 0x0020_0000.
+        if new_addr != 0 {
+            self.map_page(
+                root,
+                new_addr,
+                0x0020_0000 + vpn1*PAGE_SIZE + PAGE_SIZE,
+                FLG_R | FLG_W,
+            );
+        }
     }
 }
 

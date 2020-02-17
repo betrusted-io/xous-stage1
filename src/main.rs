@@ -182,6 +182,16 @@ impl ProgramDescription {
             );
             allocator.change_owner(pid as XousPid, sp_page);
 
+            // XXX FIXME: allocate a second page
+            let sp_page = allocator.alloc() as u32;
+            allocator.map_page(
+                satp,
+                sp_page,
+                (STACK_OFFSET - 4096) & !(PAGE_SIZE - 1),
+                flag_defaults,
+            );
+            allocator.change_owner(pid as XousPid, sp_page);
+
             assert!((self.text_offset & (PAGE_SIZE - 1)) == 0);
             assert!((self.data_offset & (PAGE_SIZE - 1)) == 0);
             if allocator.no_copy {

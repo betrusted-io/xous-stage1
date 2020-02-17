@@ -438,12 +438,11 @@ impl BootConfig {
 
         // If we had to allocate a level 1 pagetable entry, ensure that it's
         // mapped into our address space.
-        // Offset it by one page so that the root page can live at 0x0020_0000.
         if new_addr != 0 {
             self.map_page(
                 root,
                 new_addr,
-                0x0020_0000 + vpn1*PAGE_SIZE + PAGE_SIZE,
+                0x0040_0000 + vpn1*PAGE_SIZE,
                 FLG_R | FLG_W,
             );
         }

@@ -226,11 +226,6 @@ impl ProgramDescription {
             processes.processes[pid].pc = self.entrypoint;
             processes.processes[pid].state = 1;
 
-            // XXX FIXME: Map the UART for the kernel
-            if is_kernel {
-                allocator.map_page(satp, 0xE0002000, 0xF0002000, FLG_W | FLG_R);
-                allocator.change_owner(pid as XousPid, 0xE0002000);
-            }
             return self.entrypoint;
         }
         panic!("no free PID found");

@@ -5,23 +5,23 @@ _start:
     li          t0, 0xffffffff
     csrw        mideleg, t0
     csrw        medeleg, t0
-    li  a0, 0x10100000 // XXX REMOVE THIS XXX
+
     // Place the stack pointer at the end of RAM
-    lw  t0, 16(a0) // SRAM start
-    lw  t1, 20(a0) // SRAM length
+    lw          t0, 16(a0) // SRAM start
+    lw          t1, 20(a0) // SRAM length
+    add         sp, t0, t1
 
-    la t0, abort
-    csrw mtvec, t0
+    // Install a machine mode trap handler
+    la          t0, abort
+    csrw        mtvec, t0
 
-    # Point the stack pointer at the end of RAM
-    add sp, t0, t1
-
+    // Start Rust
     j   rust_entry
 
 // This is used only in debug mode.
 .global abort
 abort:
-    j   abort
+    j           abort
 
 .global start_kernel
 start_kernel:

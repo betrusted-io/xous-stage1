@@ -18,6 +18,7 @@ const FLG_R: u32 = 0x2;
 const FLG_U: u32 = 0x10;
 const FLG_A: u32 = 0x40;
 const FLG_D: u32 = 0x80;
+const STACK_PAGE_COUNT: u32 = 10;
 
 use core::panic::PanicInfo;
 #[panic_handler]
@@ -173,24 +174,26 @@ impl ProgramDescription {
             );
 
             // Allocate a page for stack
-            let sp_page = allocator.alloc() as u32;
-            allocator.map_page(
-                satp,
-                sp_page,
-                STACK_OFFSET & !(PAGE_SIZE - 1),
-                flag_defaults,
-            );
-            allocator.change_owner(pid as XousPid, sp_page);
+            // let sp_page = allocator.alloc() as u32;
+            // allocator.map_page(
+            //     satp,
+            //     sp_page,
+            //     STACK_OFFSET & !(PAGE_SIZE - 1),
+            //     flag_defaults,
+            // );
+            // allocator.change_owner(pid as XousPid, sp_page);
 
             // XXX FIXME: allocate a second page
-            let sp_page = allocator.alloc() as u32;
-            allocator.map_page(
-                satp,
-                sp_page,
-                (STACK_OFFSET - 4096) & !(PAGE_SIZE - 1),
-                flag_defaults,
-            );
-            allocator.change_owner(pid as XousPid, sp_page);
+            for i in 0..STACK_PAGE_COUNT {
+                let sp_page = allocator.alloc() as u32;
+                allocator.map_page(
+                    satp,
+                    sp_page,
+                    (STACK_OFFSET - 4096*i) & !(PAGE_SIZE - 1),
+                    flag_defaults,
+                );
+                allocator.change_owner(pid as XousPid, sp_page);
+            }
 
             assert!((self.text_offset & (PAGE_SIZE - 1)) == 0);
             assert!((self.data_offset & (PAGE_SIZE - 1)) == 0);
@@ -598,6 +601,7 @@ fn stage2(cfg: &mut BootConfig) -> ! {
 
     // This is the offset in RAM where programs are loaded from.
     let mut process_offset = cfg.sram_start as u32 + cfg.sram_size - cfg.init_size;
+    cfg.extra_pages += 1; // Why is this necessary?
 
     // Go through all Init processes and the kernel, setting up their
     // page tables and mapping memory to them.

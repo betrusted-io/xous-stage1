@@ -4,7 +4,7 @@
 mod args;
 use args::KernelArguments;
 
-use core::{mem, ptr};
+use core::{mem, ptr, slice};
 
 pub type XousPid = u8;
 const PAGE_SIZE: u32 = 4096;
@@ -82,10 +82,7 @@ struct BootConfig {
 
     /// This structure keeps track of which pages are owned
     /// and which are free. A PID of `0` indicates it's free.
-    runtime_page_tracker: *mut XousPid,
-
-    /// The size (in bytes) of the `runtime_page_tracker`.
-    runtime_page_tracker_len: u32,
+    runtime_page_tracker: &'static mut [XousPid],
 
     /// A list of system services.  Effectively, this contains
     /// the process table.
@@ -365,12 +362,10 @@ impl BootConfig {
         unsafe {
             // Grab the page address and zero it out
             bzero(pg as *mut u32, pg.add(PAGE_SIZE as usize / 4) as *mut u32);
-
-            // Mark this page as in-use by PID1
-            self.runtime_page_tracker
-                .add((self.extra_pages + self.init_size / PAGE_SIZE) as usize)
-                .write_volatile(1);
-        };
+        }
+        // Mark this page as in-use by the kernel
+        let extra_bytes = self.extra_pages * PAGE_SIZE;
+        self.runtime_page_tracker[((self.sram_size - (extra_bytes + self.init_size)) / PAGE_SIZE) as usize] = 1;
 
         // Return the address
         pg as *mut u32
@@ -379,11 +374,8 @@ impl BootConfig {
     pub fn change_owner(&mut self, pid: XousPid, region: u32) {
         // First, check to see if the region is in RAM,
         if region > self.sram_start as u32 && region < self.sram_start as u32 + self.sram_size {
-            unsafe {
-                self.runtime_page_tracker
-                    .add(((region - self.sram_start as u32) / PAGE_SIZE) as usize)
-                    .write_volatile(pid);
-            }
+            // Mark this page as in-use by the kernel
+            self.runtime_page_tracker[((region - self.sram_start as u32) / PAGE_SIZE) as usize] = pid;
             return;
         }
 
@@ -396,14 +388,8 @@ impl BootConfig {
             let region_length = unsafe { self.regions_start.add(region_offset + 1).read() };
             // let _region_name = cfg.regions_start.add(region_offset + 2).read();
             if region >= region_start && region < region_start + region_length {
-                unsafe {
-                    self.runtime_page_tracker
-                        .add(
-                            (runtime_page_tracker_len + ((region - region_start) / PAGE_SIZE))
-                                as usize,
-                        )
-                        .write_volatile(pid);
-                }
+                self.runtime_page_tracker[(runtime_page_tracker_len + ((region - region_start) / PAGE_SIZE))
+                as usize] = pid;
                 return;
             }
             runtime_page_tracker_len +=
@@ -443,11 +429,9 @@ impl BootConfig {
         // Allocate a new level 1 pagetable entry if one doesn't exist.
         if l1_pt[vpn1 as usize] & FLG_VALID == 0 {
             new_addr = self.alloc() as u32;
-
             // Mark this entry as a leaf node (WRX as 0), and indicate
             // it is a valid page by setting "V".
-            let ppn = new_addr >> 12;
-            l1_pt[vpn1 as usize] = (ppn << 10) | FLG_VALID;
+            l1_pt[vpn1 as usize] = ((new_addr >> 12) << 10) | FLG_VALID;
         }
 
         let l0_pt_idx =
@@ -455,9 +439,9 @@ impl BootConfig {
         let ref mut l0_pt = l0_pt_idx.entries;
 
         // Ensure the entry hasn't already been mapped.
-        // if l0_pt[vpn0 as usize] & 1 != 0 {
-        //     panic!("Page already allocated!");
-        // }
+        if l0_pt[vpn0 as usize] & 1 != 0 {
+            panic!("Page already allocated!");
+        }
         l0_pt[vpn0 as usize] = (ppn1 << 20) | (ppn0 << 10) | flags | FLG_VALID | FLG_D | FLG_A;
 
         // If we had to allocate a level 1 pagetable entry, ensure that it's
@@ -475,7 +459,7 @@ impl BootConfig {
 
 /// Allocate and initialize memory regions.
 /// Returns a pointer to the start of the memory region.
-fn allocate_regions(cfg: &mut BootConfig) -> (*mut XousPid, u32) {
+fn allocate_regions(cfg: &mut BootConfig) {
     // Number of individual pages in the system
     let mut runtime_page_tracker_len =
         cfg.sram_size as u32 * mem::size_of::<XousPid>() as u32 / PAGE_SIZE;
@@ -497,13 +481,7 @@ fn allocate_regions(cfg: &mut BootConfig) -> (*mut XousPid, u32) {
         );
     }
 
-    cfg.runtime_page_tracker = runtime_page_tracker as *mut XousPid;
-    cfg.runtime_page_tracker_len = runtime_page_tracker_len;
-
-    (
-        runtime_page_tracker as *mut XousPid,
-        runtime_page_tracker_len,
-    )
+    cfg.runtime_page_tracker = unsafe { slice::from_raw_parts_mut(runtime_page_tracker as *mut XousPid, runtime_page_tracker_len as usize) };
 }
 
 fn allocate_processes(cfg: &mut BootConfig) -> *mut SystemServices {
@@ -564,8 +542,7 @@ fn stage1(args: KernelArguments, _signature: u32) -> ! {
         args_base: args.base,
         init_size: 0,
         extra_pages: 0,
-        runtime_page_tracker: 0 as *mut XousPid,
-        runtime_page_tracker_len: 0,
+        runtime_page_tracker: Default::default(),
         system_services: 0 as *mut SystemServices,
     };
     read_initial_config(&args, &mut cfg);
@@ -606,14 +583,12 @@ fn stage1(args: KernelArguments, _signature: u32) -> ! {
     }
 
     // Mark all pages as in-use by the kernel.
-    // NOTE: This causes the .text section to be owned by PID1!  This
-    // will require us to transfer ownership in `stage3`
-    for i in 0..(cfg.init_size / PAGE_SIZE) {
-        unsafe {
-            (cfg.runtime_page_tracker as *mut XousPid)
-                .add((cfg.runtime_page_tracker_len - i - 1) as usize)
-                .write_volatile(1)
-        };
+    // NOTE: This causes the .text section to be owned by the kernel!  This
+    // will require us to transfer ownership in `stage3`.
+    // Note also that we skip the first index, causing the stack to be
+    // returned to the process pool.
+    for i in 1..(cfg.init_size / PAGE_SIZE) {
+        cfg.runtime_page_tracker[(cfg.runtime_page_tracker.len() as u32 - 1 - i) as usize] = 1;
     }
 
     stage2(&mut cfg);
@@ -657,10 +632,10 @@ fn stage2(cfg: &mut BootConfig) -> ! {
     let krn_struct_start = cfg.sram_start as u32 + cfg.sram_size - cfg.init_size;
     assert!(krn_struct_start & (4096 - 1) == 0);
     let krn_pg0_ptr = unsafe { (system_services.processes[0].satp as *const u32).read() };
-    for pid in system_services.processes.iter() {
-        if pid.satp == 0 {
+    for (pid, process) in system_services.processes.iter().enumerate() {
+        if pid == 0 {
             // Map boot-generated kernel structures into the kernel
-            let satp = unsafe { &mut *(pid.satp as *mut PageTable) };
+            let satp = unsafe { &mut *(process.satp as *mut PageTable) };
             for addr in (0..cfg.init_size).step_by(PAGE_SIZE as usize) {
                 cfg.map_page(
                     satp,
@@ -675,13 +650,13 @@ fn stage2(cfg: &mut BootConfig) -> ! {
             // always be made, and that the `stvec` is always valid.
             // Since it's a megapage, all we need to do is write
             // the one address to get all 4MB mapped.
-            unsafe { (pid.satp as *mut u32).write(krn_pg0_ptr) };
+            unsafe { (process.satp as *mut u32).write(krn_pg0_ptr) };
         }
     }
 
     let arg_offset = cfg.args_base as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     let ss_offset = cfg.system_services as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
-    let rpt_offset = cfg.runtime_page_tracker as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
+    let rpt_offset = cfg.runtime_page_tracker.as_ptr() as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     unsafe {
         start_kernel(
             arg_offset,

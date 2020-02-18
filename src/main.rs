@@ -10,7 +10,7 @@ pub type XousPid = u8;
 const PAGE_SIZE: u32 = 4096;
 const MAX_PROCESS_COUNT: usize = 255;
 
-const USER_STACK_OFFSET: u32 = 0xdfff_fffc;
+const USER_STACK_OFFSET: u32 = 0xdfff_fffc - 32*4;
 const PAGE_TABLE_OFFSET: u32 = 0x0040_0000;
 const PAGE_TABLE_ROOT_OFFSET: u32 = 0x0080_0000;
 const USER_AREA_START: u32 = 0x00c0_0000;
@@ -95,18 +95,19 @@ struct PageTable {
     entries: [u32; 1024],
 }
 
+#[repr(C)]
 struct Process {
     /// The absolute MMU address.  If 0, then this process is free.
     satp: u32,
-
-    /// Currently unused
-    _reserved: u32,
 
     /// Where this process is in terms of lifecycle
     state: u32,
 
     /// The last address of the program counter
     pc: u32,
+
+    /// Address of the stack pointer
+    sp: u32,
 }
 
 /// A big unifying struct containing all of the system state
@@ -155,7 +156,7 @@ impl ProgramDescription {
         allocator: &mut BootConfig,
         load_offset: u32,
         is_kernel: bool,
-        processes: &mut SystemServices,
+        ss: &mut SystemServices,
     ) -> u32 {
         let initial_pid = if is_kernel { 0 } else { 1 };
         let flag_defaults = FLG_R | FLG_W | if is_kernel { 0 } else { FLG_U };
@@ -175,16 +176,16 @@ impl ProgramDescription {
         }
 
         // Not a great algorithm!
-        for pid in (initial_pid as usize)..processes.processes.len() {
+        for pid in (initial_pid as usize)..ss.processes.len() {
             // SATP must be nonzero
-            if processes.processes[pid].satp != 0 {
+            if ss.processes[pid].satp != 0 {
                 continue;
             }
 
             // Allocate a page to handle the top-level memory translation
             let satp_address = allocator.alloc() as u32;
             allocator.change_owner(pid as XousPid, satp_address);
-            processes.processes[pid].satp = satp_address;
+            ss.processes[pid].satp = satp_address;
 
             // Turn the satp address into a pointer
             let satp = unsafe { &mut *(satp_address as *mut PageTable) };
@@ -243,8 +244,9 @@ impl ProgramDescription {
                 );
                 allocator.change_owner(pid as XousPid, load_offset + offset);
             }
-            processes.processes[pid].pc = self.entrypoint;
-            processes.processes[pid].state = 1;
+            ss.processes[pid].state = 1;
+            ss.processes[pid].pc = self.entrypoint;
+            ss.processes[pid].sp = stack_addr;
 
             return self.entrypoint;
         }
@@ -317,7 +319,7 @@ fn read_initial_config(args: &KernelArguments, cfg: &mut BootConfig) {
     }
 
     assert!(kernel_seen, "no kernel definition");
-    // assert!(init_seen, "no initial programs found");
+    assert!(init_seen, "no initial programs found");
 }
 
 /// Copy program data from the SPI flash into newly-allocated RAM
@@ -662,6 +664,14 @@ fn stage2(cfg: &mut BootConfig) -> ! {
         }
     }
 
+    // XXX FIXME As a test, map the UART to PID1
+    cfg.map_page(
+        unsafe { &mut *(system_services.processes[1].satp as *mut PageTable) },
+        0xF000_1000,
+        0xE000_1000,
+        FLG_R | FLG_W,
+    );
+
     let arg_offset = cfg.args_base as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     let ss_offset = cfg.system_services as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     let rpt_offset =
@@ -673,7 +683,7 @@ fn stage2(cfg: &mut BootConfig) -> ! {
             rpt_offset,
             (system_services.processes[0].satp >> 12) | (1 << 31),
             system_services.processes[0].pc,
-            KERNEL_STACK_OFFSET,
+            system_services.processes[0].sp,
         );
     }
 }

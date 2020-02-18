@@ -365,7 +365,8 @@ impl BootConfig {
         }
         // Mark this page as in-use by the kernel
         let extra_bytes = self.extra_pages * PAGE_SIZE;
-        self.runtime_page_tracker[((self.sram_size - (extra_bytes + self.init_size)) / PAGE_SIZE) as usize] = 1;
+        self.runtime_page_tracker
+            [((self.sram_size - (extra_bytes + self.init_size)) / PAGE_SIZE) as usize] = 1;
 
         // Return the address
         pg as *mut u32
@@ -375,7 +376,8 @@ impl BootConfig {
         // First, check to see if the region is in RAM,
         if region > self.sram_start as u32 && region < self.sram_start as u32 + self.sram_size {
             // Mark this page as in-use by the kernel
-            self.runtime_page_tracker[((region - self.sram_start as u32) / PAGE_SIZE) as usize] = pid;
+            self.runtime_page_tracker[((region - self.sram_start as u32) / PAGE_SIZE) as usize] =
+                pid;
             return;
         }
 
@@ -388,8 +390,9 @@ impl BootConfig {
             let region_length = unsafe { self.regions_start.add(region_offset + 1).read() };
             // let _region_name = cfg.regions_start.add(region_offset + 2).read();
             if region >= region_start && region < region_start + region_length {
-                self.runtime_page_tracker[(runtime_page_tracker_len + ((region - region_start) / PAGE_SIZE))
-                as usize] = pid;
+                self.runtime_page_tracker
+                    [(runtime_page_tracker_len + ((region - region_start) / PAGE_SIZE)) as usize] =
+                    pid;
                 return;
             }
             runtime_page_tracker_len +=
@@ -481,7 +484,12 @@ fn allocate_regions(cfg: &mut BootConfig) {
         );
     }
 
-    cfg.runtime_page_tracker = unsafe { slice::from_raw_parts_mut(runtime_page_tracker as *mut XousPid, runtime_page_tracker_len as usize) };
+    cfg.runtime_page_tracker = unsafe {
+        slice::from_raw_parts_mut(
+            runtime_page_tracker as *mut XousPid,
+            runtime_page_tracker_len as usize,
+        )
+    };
 }
 
 fn allocate_processes(cfg: &mut BootConfig) -> *mut SystemServices {
@@ -656,7 +664,8 @@ fn stage2(cfg: &mut BootConfig) -> ! {
 
     let arg_offset = cfg.args_base as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     let ss_offset = cfg.system_services as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
-    let rpt_offset = cfg.runtime_page_tracker.as_ptr() as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
+    let rpt_offset =
+        cfg.runtime_page_tracker.as_ptr() as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     unsafe {
         start_kernel(
             arg_offset,

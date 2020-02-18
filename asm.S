@@ -33,26 +33,20 @@ start_kernel:
     li          t0, 0xffffffff
     csrw        mideleg, t0
     csrw        medeleg, t0
-    # csrw        0xBC0, t0 // Unmask all interrupts
-
-    // Reposition the stack at a fixed offset
-    li          sp, 0xdffffffc
-
-    // Enable the MMU (once we issue `mret`) and flush the cache
-    csrw        satp, a3
-    sfence.vma
 
     // Return to Supervisor mode (and enable interrupts)
     li		    t0, (1 << 11) | (1 << 5)
     csrw	    mstatus, t0
 
+    // Enable the MMU (once we issue `mret`) and flush the cache
+    csrw        satp, a3
+    sfence.vma
+
     // Return to the address pointed to by $a4
     csrw        mepc, a4
 
-    // Issue the return
-    mret
+    // Reposition the stack at the offset passed by $a5
+    add         sp, a5, zero
 
-.global set_satp
-set_satp:
-    csrw satp, a0
-    ret
+    // Issue the return, which will jump to $mepc in Supervisor mode
+    mret

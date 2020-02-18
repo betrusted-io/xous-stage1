@@ -8,8 +8,18 @@ use core::{mem, ptr};
 
 pub type XousPid = u8;
 const PAGE_SIZE: u32 = 4096;
-const STACK_OFFSET: u32 = 0xdffffffc;
 const MAX_PROCESS_COUNT: usize = 255;
+
+const USER_STACK_OFFSET: u32 = 0xdfff_fffc;
+const PAGE_TABLE_OFFSET: u32 = 0x0040_0000;
+const PAGE_TABLE_ROOT_OFFSET: u32 = 0x0080_0000;
+const USER_AREA_START: u32 = 0x00c0_0000;
+
+// All of the kernel structures must live within Megapage 0,
+// and therefore are limited to 4 MB.
+const KERNEL_STACK_OFFSET: u32 = 0x003f_fffc;
+const KERNEL_LOAD_OFFSET: u32 = 0x0020_0000;
+const KERNEL_ARGUMENT_OFFSET: u32 = 0x0010_0000;
 
 const FLG_VALID: u32 = 0x1;
 const FLG_X: u32 = 0x8;
@@ -134,7 +144,7 @@ struct ProgramDescription {
 }
 
 extern "C" {
-    fn start_kernel(args: u32, ss: u32, rpt: u32, satp: u32, entrypoint: u32) -> !;
+    fn start_kernel(args: u32, ss: u32, rpt: u32, satp: u32, entrypoint: u32, stack: u32) -> !;
 }
 
 impl ProgramDescription {
@@ -152,6 +162,21 @@ impl ProgramDescription {
     ) -> u32 {
         let initial_pid = if is_kernel { 0 } else { 1 };
         let flag_defaults = FLG_R | FLG_W | if is_kernel { 0 } else { FLG_U };
+        let stack_addr = if is_kernel {
+            KERNEL_STACK_OFFSET
+        } else {
+            USER_STACK_OFFSET
+        };
+        if is_kernel {
+            assert!(self.text_offset == KERNEL_LOAD_OFFSET);
+            assert!(self.text_offset + self.load_size < KERNEL_STACK_OFFSET);
+            assert!(self.data_offset + self.data_size < KERNEL_STACK_OFFSET);
+            assert!(self.data_offset >= KERNEL_LOAD_OFFSET);
+        } else {
+            assert!(self.text_offset >= USER_AREA_START);
+            assert!(self.data_offset >= USER_AREA_START);
+        }
+
         // Not a great algorithm!
         for pid in (initial_pid as usize)..processes.processes.len() {
             // SATP must be nonzero
@@ -166,12 +191,7 @@ impl ProgramDescription {
 
             // Turn the satp address into a pointer
             let satp = unsafe { &mut *(satp_address as *mut PageTable) };
-            allocator.map_page(
-                satp,
-                satp_address,
-                0x0020_0000,
-                FLG_R | FLG_W,
-            );
+            allocator.map_page(satp, satp_address, PAGE_TABLE_ROOT_OFFSET, FLG_R | FLG_W);
 
             // Allocate a page for stack
             // let sp_page = allocator.alloc() as u32;
@@ -189,7 +209,7 @@ impl ProgramDescription {
                 allocator.map_page(
                     satp,
                     sp_page,
-                    (STACK_OFFSET - 4096*i) & !(PAGE_SIZE - 1),
+                    (stack_addr - 4096 * i) & !(PAGE_SIZE - 1),
                     flag_defaults,
                 );
                 allocator.change_owner(pid as XousPid, sp_page);
@@ -246,6 +266,7 @@ where
     }
 }
 
+/// Copy _count_ **bytes** from src to dest.
 pub unsafe fn memcpy<T>(dest: *mut T, src: *const T, count: usize)
 where
     T: Copy,
@@ -302,6 +323,8 @@ fn read_initial_config(args: &KernelArguments, cfg: &mut BootConfig) {
     // assert!(init_seen, "no initial programs found");
 }
 
+/// Copy program data from the SPI flash into newly-allocated RAM
+/// located at the end of memory space.
 fn copy_processes(cfg: &mut BootConfig, args: &KernelArguments) {
     for tag in args.iter() {
         if tag.name == make_type!("XKrn") || tag.name == make_type!("Init") {
@@ -312,8 +335,11 @@ fn copy_processes(cfg: &mut BootConfig, args: &KernelArguments) {
             cfg.extra_pages += load_size_rounded / PAGE_SIZE;
             let top = cfg.get_top();
             unsafe {
-                let base = cfg.base_addr.add(prog.load_offset as usize / 4);
-                memcpy(top, base, prog.load_size as usize);
+                // Copy the program to the target address, rounding it off to the load size.
+                let src_addr = cfg.base_addr.add(prog.load_offset as usize / 4);
+                memcpy(top, src_addr, prog.load_size as usize);
+
+                // Zero out the remaining data.
                 bzero(
                     top.add(prog.load_size as usize / 4),
                     top.add(load_size_rounded as usize / 4),
@@ -440,7 +466,7 @@ impl BootConfig {
             self.map_page(
                 root,
                 new_addr,
-                0x0040_0000 + vpn1*PAGE_SIZE,
+                PAGE_TABLE_OFFSET + vpn1 * PAGE_SIZE,
                 FLG_R | FLG_W,
             );
         }
@@ -601,16 +627,9 @@ fn stage2(cfg: &mut BootConfig) -> ! {
 
     // This is the offset in RAM where programs are loaded from.
     let mut process_offset = cfg.sram_start as u32 + cfg.sram_size - cfg.init_size;
-    cfg.extra_pages += 1; // Why is this necessary?
 
     // Go through all Init processes and the kernel, setting up their
     // page tables and mapping memory to them.
-    let mut kernel_text_poffset = 0;
-    let mut kernel_text_voffset = 0;
-    let mut kernel_text_size = 0;
-    let mut kernel_data_poffset = 0;
-    let mut kernel_data_voffset = 0;
-    let mut kernel_data_size = 0;
     for tag in args.iter() {
         if tag.name == make_type!("Init") {
             let init = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
@@ -625,12 +644,6 @@ fn stage2(cfg: &mut BootConfig) -> ! {
         } else if tag.name == make_type!("XKrn") {
             let xkrn = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
             let load_size_rounded = (xkrn.load_size + 4096 - 1) & !(4096 - 1);
-            kernel_text_size = load_size_rounded;
-            kernel_text_poffset = process_offset - kernel_text_size;
-            kernel_text_voffset = xkrn.text_offset;
-            kernel_data_size = xkrn.data_size;
-            kernel_data_poffset = kernel_text_poffset - kernel_data_size;
-            kernel_data_voffset = xkrn.data_offset;
             xkrn.load(
                 cfg,
                 process_offset - load_size_rounded,
@@ -642,45 +655,33 @@ fn stage2(cfg: &mut BootConfig) -> ! {
     }
 
     let krn_struct_start = cfg.sram_start as u32 + cfg.sram_size - cfg.init_size;
+    assert!(krn_struct_start & (4096 - 1) == 0);
+    let krn_pg0_ptr = unsafe { (system_services.processes[0].satp as *const u32).read() };
     for pid in system_services.processes.iter() {
         if pid.satp == 0 {
-            continue;
-        }
-        // Map kernel structures to each allocated process space
-        let satp = unsafe { &mut *(pid.satp as *mut PageTable) };
-        for (off, addr) in (0..cfg.init_size).step_by(PAGE_SIZE as usize).enumerate() {
-            cfg.map_page(
-                satp,
-                krn_struct_start + addr,
-                off as u32 * PAGE_SIZE + 0x00100000,
-                FLG_R | FLG_W,
-            );
-        }
-
-        // Map the kernel text section into every process
-        for offset in (0..kernel_text_size).step_by(PAGE_SIZE as usize) {
-            cfg.map_page(
-                satp,
-                kernel_text_poffset + offset,
-                kernel_text_voffset + offset,
-                FLG_R | FLG_W | FLG_X,
-            );
-        }
-
-        // Map the kernel data section into every process.
-        for offset in (0..kernel_data_size).step_by(PAGE_SIZE as usize) {
-            cfg.map_page(
-                satp,
-                kernel_data_poffset + offset,
-                kernel_data_voffset + offset,
-                FLG_R | FLG_W,
-            );
+            // Map boot-generated kernel structures into the kernel
+            let satp = unsafe { &mut *(pid.satp as *mut PageTable) };
+            for addr in (0..cfg.init_size).step_by(PAGE_SIZE as usize) {
+                cfg.map_page(
+                    satp,
+                    addr + krn_struct_start,
+                    addr + KERNEL_ARGUMENT_OFFSET,
+                    FLG_R | FLG_W,
+                );
+            }
+        } else {
+            // Copy the kernel's "MMU Page 0" into every process.
+            // This ensures a context switch into the kernel can
+            // always be made, and that the `stvec` is always valid.
+            // Since it's a megapage, all we need to do is write
+            // the one address to get all 4MB mapped.
+            unsafe { (pid.satp as *mut u32).write(krn_pg0_ptr) };
         }
     }
 
-    let arg_offset = cfg.args_base as u32 - krn_struct_start + 0x00100000;
-    let ss_offset = cfg.system_services as u32 - krn_struct_start + 0x00100000;
-    let rpt_offset = cfg.runtime_page_tracker as u32 - krn_struct_start + 0x00100000;
+    let arg_offset = cfg.args_base as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
+    let ss_offset = cfg.system_services as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
+    let rpt_offset = cfg.runtime_page_tracker as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     unsafe {
         start_kernel(
             arg_offset,
@@ -688,6 +689,7 @@ fn stage2(cfg: &mut BootConfig) -> ! {
             rpt_offset,
             (system_services.processes[0].satp >> 12) | (1 << 31),
             system_services.processes[0].pc,
+            KERNEL_STACK_OFFSET,
         );
     }
 }

@@ -668,3 +668,77 @@ fn stage2(cfg: &mut BootConfig) -> ! {
         );
     }
 }
+
+// pub struct Uart {
+//     pub base: *mut u32,
+// }
+
+// pub const SUPERVISOR_UART: Uart = Uart {
+//     base: 0xF000_2000 as *mut u32,
+// };
+
+// impl Uart {
+//     pub fn putc(&self, c: u8) {
+//         unsafe {
+//             // Wait until TXFULL is `0`
+//             while self.base.add(1).read_volatile() != 0 {
+//                 ()
+//             }
+//             self.base.add(0).write_volatile(c as u32)
+//         };
+//     }
+// }
+
+// use core::fmt::{Error, Write};
+// impl Write for Uart {
+//     fn write_str(&mut self, s: &str) -> Result<(), Error> {
+//         for c in s.bytes() {
+//             self.putc(c);
+//         }
+//         Ok(())
+//     }
+// }
+
+// #[macro_export]
+// macro_rules! sprint
+// {
+// 	($($args:tt)+) => ({
+// 			use core::fmt::Write;
+// 			let _ = write!(crate::SUPERVISOR_UART, $($args)+);
+// 	});
+// }
+
+// #[macro_export]
+// macro_rules! sprintln
+// {
+// 	() => ({
+// 		sprint!("\r\n")
+// 	});
+// 	($fmt:expr) => ({
+// 		sprint!(concat!($fmt, "\r\n"))
+// 	});
+// 	($fmt:expr, $($args:tt)+) => ({
+// 		sprint!(concat!($fmt, "\r\n"), $($args)+)
+// 	});
+// }
+
+// fn print_pagetable(root: u32) {
+//         sprintln!("Memory Maps:");
+//         let l1_pt = unsafe { &mut (*(root as *mut PageTable)) };
+//         for (i, l1_entry) in l1_pt.entries.iter().enumerate() {
+//             if *l1_entry == 0 {
+//                 continue;
+//             }
+//             let superpage_addr = i as u32 * (1<<22);
+//             sprintln!("    {:4} Superpage for {:08x} @ {:08x} (flags: {})", i,  superpage_addr, (*l1_entry>>10)<<12, l1_entry & 0xff);
+//             // let l0_pt_addr = ((l1_entry >> 10) << 12) as *const u32;
+//             let l0_pt = unsafe { &mut (*(((*l1_entry>>10)<<12) as *mut PageTable)) };
+//             for (j, l0_entry) in l0_pt.entries.iter().enumerate() {
+//                 if *l0_entry == 0 {
+//                     continue;
+//                 }
+//                 let page_addr = j as u32 * (1<<12);
+//                 sprintln!("        {:4} {:08x} -> {:08x} (flags: {})", j, superpage_addr + page_addr, (*l0_entry>>10)<<12, l0_entry & 0xff);
+//             }
+//         }
+// }

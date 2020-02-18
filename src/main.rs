@@ -111,6 +111,7 @@ struct Process {
 }
 
 /// A big unifying struct containing all of the system state
+#[repr(C)]
 struct SystemServices {
     /// A table of all processes on the system
     processes: [Process; MAX_PROCESS_COUNT],

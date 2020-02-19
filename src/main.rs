@@ -10,7 +10,7 @@ pub type XousPid = u8;
 const PAGE_SIZE: u32 = 4096;
 const MAX_PROCESS_COUNT: usize = 255;
 
-const USER_STACK_OFFSET: u32 = 0xdfff_fffc - 32*4;
+const USER_STACK_OFFSET: u32 = 0xdfff_fffc - 32 * 4;
 const PAGE_TABLE_OFFSET: u32 = 0x0040_0000;
 const PAGE_TABLE_ROOT_OFFSET: u32 = 0x0080_0000;
 const USER_AREA_START: u32 = 0x00c0_0000;
@@ -32,7 +32,8 @@ const STACK_PAGE_COUNT: u32 = 10;
 
 use core::panic::PanicInfo;
 #[panic_handler]
-fn handle_panic(_arg: &PanicInfo) -> ! {
+fn handle_panic(arg: &PanicInfo) -> ! {
+    sprintln!("{}", arg);
     loop {}
 }
 
@@ -43,6 +44,14 @@ macro_rules! make_type {
         c.copy_from_slice($fcc.as_bytes());
         u32::from_le_bytes(c)
     }};
+}
+
+#[repr(C)]
+struct MemoryRegionExtra {
+    start: u32,
+    length: u32,
+    name: u32,
+    padding: u32,
 }
 
 /// In-memory copy of the configuration page,
@@ -57,11 +66,8 @@ struct BootConfig {
     /// Where the tagged args lsit starts in RAM.
     args_base: *const u32,
 
-    /// The start of the memory region listing
-    regions_start: *mut u32,
-
-    /// The size of the memory region listing, in bytes
-    regions_size: u32,
+    /// Additional memory regions in this system
+    regions: &'static [MemoryRegionExtra],
 
     /// The origin of usable memory.  This is where heap lives.
     sram_start: *mut u32,
@@ -293,8 +299,12 @@ fn read_initial_config(args: &KernelArguments, cfg: &mut BootConfig) {
 
     for tag in i {
         if tag.name == make_type!("MREx") {
-            cfg.regions_start = tag.data.as_ptr() as *mut u32;
-            cfg.regions_size = tag.size;
+            cfg.regions = unsafe {
+                slice::from_raw_parts(
+                    tag.data.as_ptr() as *const MemoryRegionExtra,
+                    tag.size as usize / mem::size_of::<u32>() / mem::size_of::<MemoryRegionExtra>(),
+                )
+            };
         } else if tag.name == make_type!("Bflg") {
             let boot_flags = tag.data[0];
             if boot_flags & 1 != 0 {
@@ -375,12 +385,11 @@ impl BootConfig {
         pg as *mut u32
     }
 
-    pub fn change_owner(&mut self, pid: XousPid, region: u32) {
+    pub fn change_owner(&mut self, pid: XousPid, addr: u32) {
         // First, check to see if the region is in RAM,
-        if region > self.sram_start as u32 && region < self.sram_start as u32 + self.sram_size {
+        if addr > self.sram_start as u32 && addr < self.sram_start as u32 + self.sram_size {
             // Mark this page as in-use by the kernel
-            self.runtime_page_tracker[((region - self.sram_start as u32) / PAGE_SIZE) as usize] =
-                pid;
+            self.runtime_page_tracker[((addr - self.sram_start as u32) / PAGE_SIZE) as usize] = pid;
             return;
         }
 
@@ -388,22 +397,19 @@ impl BootConfig {
         let mut runtime_page_tracker_len =
             self.sram_size * mem::size_of::<XousPid>() as u32 / PAGE_SIZE;
 
-        for region_offset in (0..(self.regions_size / 4) as usize).step_by(3) {
-            let region_start = unsafe { self.regions_start.add(region_offset + 0).read() };
-            let region_length = unsafe { self.regions_start.add(region_offset + 1).read() };
-            // let _region_name = cfg.regions_start.add(region_offset + 2).read();
-            if region >= region_start && region < region_start + region_length {
+        for region in self.regions.iter() {
+            if addr >= region.start && addr < region.start + region.length {
                 self.runtime_page_tracker
-                    [(runtime_page_tracker_len + ((region - region_start) / PAGE_SIZE)) as usize] =
+                    [(runtime_page_tracker_len + ((addr - region.start) / PAGE_SIZE)) as usize] =
                     pid;
                 return;
             }
             runtime_page_tracker_len +=
-                region_length * mem::size_of::<XousPid>() as u32 / PAGE_SIZE;
+                region.length * mem::size_of::<XousPid>() as u32 / PAGE_SIZE;
         }
         panic!(
-            "Tried to change region {:08x} that isn't in the memory region!",
-            region
+            "Tried to change region {:08x} that isn't in defined memory!",
+            addr
         );
     }
 
@@ -445,9 +451,9 @@ impl BootConfig {
         let ref mut l0_pt = l0_pt_idx.entries;
 
         // Ensure the entry hasn't already been mapped.
-        if l0_pt[vpn0 as usize] & 1 != 0 {
-            panic!("Page already allocated!");
-        }
+        // if l0_pt[vpn0 as usize] & 1 != 0 {
+        //     panic!("Page already allocated!");
+        // }
         l0_pt[vpn0 as usize] = (ppn1 << 20) | (ppn0 << 10) | flags | FLG_VALID | FLG_D | FLG_A;
 
         // If we had to allocate a level 1 pagetable entry, ensure that it's
@@ -470,11 +476,9 @@ fn allocate_regions(cfg: &mut BootConfig) {
     let mut runtime_page_tracker_len =
         cfg.sram_size as u32 * mem::size_of::<XousPid>() as u32 / PAGE_SIZE;
 
-    for region_offset in (0..(cfg.regions_size / 4) as usize).step_by(3) {
-        // let _region_start = cfg.regions_start.add(region_offset + 0).read();
-        let region_length = unsafe { cfg.regions_start.add(region_offset + 1).read() };
-        // let _region_name = cfg.regions_start.add(region_offset + 2).read();
-        runtime_page_tracker_len += region_length * mem::size_of::<XousPid>() as u32 / PAGE_SIZE;
+    for region in cfg.regions.iter() {
+        let region_length_rounded = (region.length + 4096 - 1) & !(4096 - 1);
+        runtime_page_tracker_len += region_length_rounded  * mem::size_of::<XousPid>() as u32 / PAGE_SIZE;
     }
     cfg.init_size += runtime_page_tracker_len;
 
@@ -546,8 +550,7 @@ fn stage1(args: KernelArguments, _signature: u32) -> ! {
     let mut cfg = BootConfig {
         no_copy: false,
         base_addr: args.base,
-        regions_start: 0 as *mut u32,
-        regions_size: 0,
+        regions: Default::default(),
         sram_start: 0 as *mut u32,
         sram_size: 0,
         args_base: args.base,
@@ -673,6 +676,7 @@ fn stage2(cfg: &mut BootConfig) -> ! {
         FLG_R | FLG_W,
     );
 
+    print_pagetable(system_services.processes[0].satp);
     let arg_offset = cfg.args_base as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     let ss_offset = cfg.system_services as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     let rpt_offset =
@@ -689,76 +693,88 @@ fn stage2(cfg: &mut BootConfig) -> ! {
     }
 }
 
-// pub struct Uart {
-//     pub base: *mut u32,
-// }
+pub struct Uart {
+    pub base: *mut u32,
+}
 
-// pub const SUPERVISOR_UART: Uart = Uart {
-//     base: 0xF000_2000 as *mut u32,
-// };
+pub const SUPERVISOR_UART: Uart = Uart {
+    base: 0xF000_2000 as *mut u32,
+};
 
-// impl Uart {
-//     pub fn putc(&self, c: u8) {
-//         unsafe {
-//             // Wait until TXFULL is `0`
-//             while self.base.add(1).read_volatile() != 0 {
-//                 ()
-//             }
-//             self.base.add(0).write_volatile(c as u32)
-//         };
-//     }
-// }
+impl Uart {
+    pub fn putc(&self, c: u8) {
+        unsafe {
+            // Wait until TXFULL is `0`
+            while self.base.add(1).read_volatile() != 0 {
+                ()
+            }
+            self.base.add(0).write_volatile(c as u32)
+        };
+    }
+}
 
-// use core::fmt::{Error, Write};
-// impl Write for Uart {
-//     fn write_str(&mut self, s: &str) -> Result<(), Error> {
-//         for c in s.bytes() {
-//             self.putc(c);
-//         }
-//         Ok(())
-//     }
-// }
+use core::fmt::{Error, Write};
+impl Write for Uart {
+    fn write_str(&mut self, s: &str) -> Result<(), Error> {
+        for c in s.bytes() {
+            self.putc(c);
+        }
+        Ok(())
+    }
+}
 
-// #[macro_export]
-// macro_rules! sprint
-// {
-// 	($($args:tt)+) => ({
-// 			use core::fmt::Write;
-// 			let _ = write!(crate::SUPERVISOR_UART, $($args)+);
-// 	});
-// }
+#[macro_export]
+macro_rules! sprint
+{
+	($($args:tt)+) => ({
+			use core::fmt::Write;
+			let _ = write!(crate::SUPERVISOR_UART, $($args)+);
+	});
+}
 
-// #[macro_export]
-// macro_rules! sprintln
-// {
-// 	() => ({
-// 		sprint!("\r\n")
-// 	});
-// 	($fmt:expr) => ({
-// 		sprint!(concat!($fmt, "\r\n"))
-// 	});
-// 	($fmt:expr, $($args:tt)+) => ({
-// 		sprint!(concat!($fmt, "\r\n"), $($args)+)
-// 	});
-// }
+#[macro_export]
+macro_rules! sprintln
+{
+	() => ({
+		sprint!("\r\n")
+	});
+	($fmt:expr) => ({
+		sprint!(concat!($fmt, "\r\n"))
+	});
+	($fmt:expr, $($args:tt)+) => ({
+		sprint!(concat!($fmt, "\r\n"), $($args)+)
+	});
+}
 
-// fn print_pagetable(root: u32) {
-//         sprintln!("Memory Maps:");
-//         let l1_pt = unsafe { &mut (*(root as *mut PageTable)) };
-//         for (i, l1_entry) in l1_pt.entries.iter().enumerate() {
-//             if *l1_entry == 0 {
-//                 continue;
-//             }
-//             let superpage_addr = i as u32 * (1<<22);
-//             sprintln!("    {:4} Superpage for {:08x} @ {:08x} (flags: {})", i,  superpage_addr, (*l1_entry>>10)<<12, l1_entry & 0xff);
-//             // let l0_pt_addr = ((l1_entry >> 10) << 12) as *const u32;
-//             let l0_pt = unsafe { &mut (*(((*l1_entry>>10)<<12) as *mut PageTable)) };
-//             for (j, l0_entry) in l0_pt.entries.iter().enumerate() {
-//                 if *l0_entry == 0 {
-//                     continue;
-//                 }
-//                 let page_addr = j as u32 * (1<<12);
-//                 sprintln!("        {:4} {:08x} -> {:08x} (flags: {})", j, superpage_addr + page_addr, (*l0_entry>>10)<<12, l0_entry & 0xff);
-//             }
-//         }
-// }
+fn print_pagetable(root: u32) {
+    sprintln!("Memory Maps:");
+    let l1_pt = unsafe { &mut (*(root as *mut PageTable)) };
+    for (i, l1_entry) in l1_pt.entries.iter().enumerate() {
+        if *l1_entry == 0 {
+            continue;
+        }
+        let superpage_addr = i as u32 * (1 << 22);
+        sprintln!(
+            "    {:4} Superpage for {:08x} @ {:08x} (flags: {})",
+            i,
+            superpage_addr,
+            (*l1_entry >> 10) << 12,
+            l1_entry & 0xff
+        );
+        // let l0_pt_addr = ((l1_entry >> 10) << 12) as *const u32;
+        let l0_pt = unsafe { &mut (*(((*l1_entry >> 10) << 12) as *mut PageTable)) };
+        for (j, l0_entry) in l0_pt.entries.iter().enumerate() {
+            if *l0_entry == 0 {
+                continue;
+            }
+            let page_addr = j as u32 * (1 << 12);
+            sprintln!(
+                "        {:4} {:08x} -> {:08x} (flags: {})",
+                j,
+                superpage_addr + page_addr,
+                (*l0_entry >> 10) << 12,
+                l0_entry & 0xff
+            );
+        }
+    }
+}

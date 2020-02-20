@@ -27,7 +27,7 @@ const FLG_R: u32 = 0x2;
 const FLG_U: u32 = 0x10;
 const FLG_A: u32 = 0x40;
 const FLG_D: u32 = 0x80;
-const STACK_PAGE_COUNT: u32 = 10;
+const STACK_PAGE_COUNT: u32 = 1;
 
 use core::panic::PanicInfo;
 #[panic_handler]

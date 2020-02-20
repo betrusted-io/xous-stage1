@@ -16,7 +16,7 @@ const USER_AREA_START: u32 = 0x00c0_0000;
 
 // All of the kernel structures must live within Megapage 0,
 // and therefore are limited to 4 MB.
-const KERNEL_STACK_OFFSET: u32 = 0x003f_fffc;
+const EXCEPTION_STACK_OFFSET: u32 = 0x003f_fffc;
 const KERNEL_LOAD_OFFSET: u32 = 0x0020_0000;
 const KERNEL_ARGUMENT_OFFSET: u32 = 0x0010_0000;
 
@@ -162,15 +162,11 @@ impl ProgramDescription {
         let pid_idx = (pid - 1) as usize;
         let is_kernel = pid == 1;
         let flag_defaults = FLG_R | FLG_W | if is_kernel { 0 } else { FLG_U };
-        let stack_addr = if is_kernel {
-            KERNEL_STACK_OFFSET
-        } else {
-            USER_STACK_OFFSET
-        };
+        let stack_addr = USER_STACK_OFFSET;
         if is_kernel {
             assert!(self.text_offset == KERNEL_LOAD_OFFSET);
-            assert!(self.text_offset + self.load_size < KERNEL_STACK_OFFSET);
-            assert!(self.data_offset + self.data_size < KERNEL_STACK_OFFSET);
+            assert!(self.text_offset + self.load_size < EXCEPTION_STACK_OFFSET);
+            assert!(self.data_offset + self.data_size < EXCEPTION_STACK_OFFSET);
             assert!(self.data_offset >= KERNEL_LOAD_OFFSET);
         } else {
             assert!(self.text_offset >= USER_AREA_START);
@@ -200,7 +196,7 @@ impl ProgramDescription {
             // );
             // allocator.change_owner(pid as XousPid, sp_page);
 
-        // XXX FIXME: allocate a second page
+        // Allocate stack pages.
         for i in 0..STACK_PAGE_COUNT {
             let sp_page = allocator.alloc() as u32;
             allocator.map_page(
@@ -210,6 +206,18 @@ impl ProgramDescription {
                 flag_defaults,
             );
             allocator.change_owner(pid as XousPid, sp_page);
+
+            // If it's the kernel, also allocate an exception page
+            if is_kernel {
+                let sp_page = allocator.alloc() as u32;
+                allocator.map_page(
+                    satp,
+                    sp_page,
+                    (EXCEPTION_STACK_OFFSET - 4096 * i) & !(PAGE_SIZE - 1),
+                    flag_defaults,
+                );
+                allocator.change_owner(pid as XousPid, sp_page);
+            }
         }
 
         assert!((self.text_offset & (PAGE_SIZE - 1)) == 0);

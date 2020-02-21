@@ -186,15 +186,14 @@ impl ProgramDescription {
         let satp = unsafe { &mut *(satp_address as *mut PageTable) };
         allocator.map_page(satp, satp_address, PAGE_TABLE_ROOT_OFFSET, FLG_R | FLG_W);
 
-            // Allocate a page for stack
-            // let sp_page = allocator.alloc() as u32;
-            // allocator.map_page(
-            //     satp,
-            //     sp_page,
-            //     STACK_OFFSET & !(PAGE_SIZE - 1),
-            //     flag_defaults,
-            // );
-            // allocator.change_owner(pid as XousPid, sp_page);
+        // Ensure the pagetables are mapped as well
+        let pt_addr = allocator.alloc() as u32;
+        allocator.map_page(
+            satp,
+            pt_addr,
+            PAGE_TABLE_OFFSET + 0,
+            FLG_R | FLG_W,
+        );
 
         // Allocate stack pages.
         for i in 0..STACK_PAGE_COUNT {
@@ -251,6 +250,7 @@ impl ProgramDescription {
             );
             allocator.change_owner(pid as XousPid, load_offset + offset);
         }
+
         let ref mut process = allocator.processes[pid_idx];
         process.entrypoint = self.entrypoint;
         process.sp = stack_addr;
@@ -666,15 +666,21 @@ fn stage2(cfg: &mut BootConfig) -> ! {
         unsafe { (l1_pt_addr as *mut u32).write(krn_pg0_ptr) };
     }
 
-    // XXX FIXME As a test, map the UART to PID1
-    cfg.map_page(
-        unsafe { &mut *((cfg.processes[1].satp << 12) as *mut PageTable) },
-        0xF000_1000,
-        0xE000_1000,
-        FLG_R | FLG_W,
-    );
+    // // XXX FIXME As a test, map the UART to PID1
+    // cfg.map_page(
+    //     unsafe { &mut *((cfg.processes[1].satp << 12) as *mut PageTable) },
+    //     0xF000_1000,
+    //     0xE000_1000,
+    //     FLG_R | FLG_W,
+    // );
 
+    // sprintln!("PID1 pagetables:");
     // print_pagetable(cfg.processes[0].satp);
+    // sprintln!("");
+    // sprintln!("");
+    // sprintln!("PID2 pagetables:");
+    // print_pagetable(cfg.processes[1].satp);
+
     let arg_offset = cfg.args_base as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     let ss_offset = cfg.processes.as_ptr() as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     let rpt_offset =
@@ -745,15 +751,15 @@ fn stage2(cfg: &mut BootConfig) -> ! {
 // }
 
 // fn print_pagetable(root: u32) {
-//     sprintln!("Memory Maps:");
-//     let l1_pt = unsafe { &mut (*(root as *mut PageTable)) };
+//     sprintln!("Memory Maps (SATP: {:08x}  Root: {:08x}):", root, root<<12);
+//     let l1_pt = unsafe { &mut (*((root<<12) as *mut PageTable)) };
 //     for (i, l1_entry) in l1_pt.entries.iter().enumerate() {
 //         if *l1_entry == 0 {
 //             continue;
 //         }
 //         let superpage_addr = i as u32 * (1 << 22);
 //         sprintln!(
-//             "    {:4} Superpage for {:08x} @ {:08x} (flags: {})",
+//             "    {:4} Superpage for {:08x} @ {:08x} (flags: {:02x})",
 //             i,
 //             superpage_addr,
 //             (*l1_entry >> 10) << 12,
@@ -767,7 +773,7 @@ fn stage2(cfg: &mut BootConfig) -> ! {
 //             }
 //             let page_addr = j as u32 * (1 << 12);
 //             sprintln!(
-//                 "        {:4} {:08x} -> {:08x} (flags: {})",
+//                 "        {:4} {:08x} -> {:08x} (flags: {:02x})",
 //                 j,
 //                 superpage_addr + page_addr,
 //                 (*l0_entry >> 10) << 12,

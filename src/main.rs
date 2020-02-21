@@ -9,7 +9,7 @@ use core::{mem, ptr, slice};
 pub type XousPid = u8;
 const PAGE_SIZE: u32 = 4096;
 
-const USER_STACK_OFFSET: u32 = 0xdfff_fffc - 32 * 4;
+const USER_STACK_OFFSET: u32 = 0xdfff_fffc;
 const PAGE_TABLE_OFFSET: u32 = 0x0040_0000;
 const PAGE_TABLE_ROOT_OFFSET: u32 = 0x0080_0000;
 const USER_AREA_START: u32 = 0x00c0_0000;

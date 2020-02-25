@@ -33,7 +33,7 @@ const STACK_PAGE_COUNT: usize = 1;
 use core::panic::PanicInfo;
 #[panic_handler]
 fn handle_panic(_arg: &PanicInfo) -> ! {
-    // sprintln!("{}", arg);
+    // sprintln!("{}", _arg);
     loop {}
 }
 
@@ -300,7 +300,7 @@ fn read_initial_config(args: &KernelArguments, cfg: &mut BootConfig) {
             cfg.regions = unsafe {
                 slice::from_raw_parts(
                     tag.data.as_ptr() as *const MemoryRegionExtra,
-                    tag.size as usize / mem::size_of::<u32>() / mem::size_of::<MemoryRegionExtra>(),
+                    tag.size as usize / mem::size_of::<MemoryRegionExtra>(),
                 )
             };
         } else if tag.name == make_type!("Bflg") {
@@ -377,8 +377,8 @@ impl BootConfig {
         }
         // Mark this page as in-use by the kernel
         let extra_bytes = self.extra_pages * PAGE_SIZE;
-        self.runtime_page_tracker
-            [(self.sram_size - (extra_bytes + self.init_size)) / PAGE_SIZE] = 1;
+        self.runtime_page_tracker[(self.sram_size - (extra_bytes + self.init_size)) / PAGE_SIZE] =
+            1;
 
         // Return the address
         pg as *mut usize
@@ -391,22 +391,17 @@ impl BootConfig {
             self.runtime_page_tracker[(addr - self.sram_start as usize) / PAGE_SIZE] = pid;
             return;
         }
-
         // The region isn't in RAM, so check the other memory regions.
-        let mut runtime_page_tracker_len =
-            self.sram_size * mem::size_of::<XousPid>() as usize / PAGE_SIZE;
+        let mut rpt_offset = self.sram_size / PAGE_SIZE;
 
         for region in self.regions.iter() {
-            if addr >= region.start as usize
-                && addr < region.start as usize + region.length as usize
-            {
-                self.runtime_page_tracker[runtime_page_tracker_len
-                    + ((addr - region.start as usize) / PAGE_SIZE)
-                    ] = pid;
+            let rstart = region.start as usize;
+            let rlen = region.length as usize;
+            if addr >= rstart && addr < rstart + rlen {
+                self.runtime_page_tracker[rpt_offset + (addr - rstart) / PAGE_SIZE] = pid;
                 return;
             }
-            runtime_page_tracker_len +=
-                region.length as usize * mem::size_of::<XousPid>() as usize / PAGE_SIZE;
+            rpt_offset += rlen / PAGE_SIZE;
         }
         panic!(
             "Tried to change region {:08x} that isn't in defined memory!",
@@ -474,29 +469,32 @@ impl BootConfig {
 /// Returns a pointer to the start of the memory region.
 fn allocate_regions(cfg: &mut BootConfig) {
     // Number of individual pages in the system
-    let mut runtime_page_tracker_len = cfg.sram_size * mem::size_of::<XousPid>() / PAGE_SIZE;
+    let mut rpt_pages = cfg.sram_size / PAGE_SIZE;
 
     for region in cfg.regions.iter() {
+        // sprintln!(
+        //     "Discovered region {:08x} ({:08x} - {:08x}) -- {} bytes",
+        //     region.name,
+        //     region.start,
+        //     region.start + region.length,
+        //     region.length
+        // );
         let region_length_rounded = (region.length as usize + 4096 - 1) & !(4096 - 1);
-        runtime_page_tracker_len += region_length_rounded * mem::size_of::<XousPid>() / PAGE_SIZE;
+        rpt_pages += region_length_rounded / PAGE_SIZE;
     }
-    cfg.init_size += runtime_page_tracker_len;
+    cfg.init_size += rpt_pages * mem::size_of::<XousPid>();
 
     // Clear all memory pages such that they're not owned by anyone
     let runtime_page_tracker = cfg.get_top();
     unsafe {
         bzero(
             runtime_page_tracker,
-            runtime_page_tracker.add(runtime_page_tracker_len / 4),
+            runtime_page_tracker.add(rpt_pages / mem::size_of::<usize>()),
         );
     }
 
-    cfg.runtime_page_tracker = unsafe {
-        slice::from_raw_parts_mut(
-            runtime_page_tracker as *mut XousPid,
-            runtime_page_tracker_len,
-        )
-    };
+    cfg.runtime_page_tracker =
+        unsafe { slice::from_raw_parts_mut(runtime_page_tracker as *mut XousPid, rpt_pages) };
 }
 
 fn allocate_processes(cfg: &mut BootConfig) {
@@ -511,19 +509,6 @@ fn allocate_processes(cfg: &mut BootConfig) {
     cfg.processes = unsafe {
         slice::from_raw_parts_mut(processes as *mut InitialProcess, process_count as usize)
     };
-}
-
-fn allocate_config(cfg: &mut BootConfig) -> &mut BootConfig {
-    cfg.init_size += mem::size_of::<BootConfig>();
-    let top = cfg.get_top();
-    unsafe {
-        memcpy(
-            top,
-            cfg as *const BootConfig as *const usize,
-            mem::size_of::<BootConfig>(),
-        )
-    };
-    unsafe { &mut (*(top as *mut BootConfig)) }
 }
 
 fn copy_args(cfg: &mut BootConfig, args: &KernelArguments) {
@@ -581,9 +566,6 @@ fn stage1(args: KernelArguments, _signature: u32) -> ! {
     // The kernel, as well as initial processes, are all stored in RAM.
     allocate_processes(&mut cfg);
 
-    // Switch from using our stack-allocated config to a heap-allocated config.
-    let mut cfg = allocate_config(&mut cfg);
-
     // Copy the arguments, if requested
     if cfg.no_copy {
         // TODO: place args into cfg.args
@@ -608,7 +590,7 @@ fn stage1(args: KernelArguments, _signature: u32) -> ! {
     // Note also that we skip the first index, causing the stack to be
     // returned to the process pool.
     for i in 1..(cfg.init_size / PAGE_SIZE) {
-        cfg.runtime_page_tracker[cfg.runtime_page_tracker.len() - 1 - i] = 1;
+        cfg.runtime_page_tracker[cfg.sram_size / PAGE_SIZE - i] = 1;
     }
 
     stage2(&mut cfg);
@@ -680,6 +662,11 @@ fn stage2(cfg: &mut BootConfig) -> ! {
     // sprintln!("");
     // sprintln!("PID2 pagetables:");
     // print_pagetable(cfg.processes[1].satp);
+    // sprintln!(
+    //     "Runtime Page Tracker: {} bytes",
+    //     cfg.runtime_page_tracker.len()
+    // );
+    cfg.runtime_page_tracker[cfg.sram_size / PAGE_SIZE - 1] = 0;
 
     let arg_offset = cfg.args_base as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     let ip_offset = cfg.processes.as_ptr() as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
@@ -702,7 +689,7 @@ fn stage2(cfg: &mut BootConfig) -> ! {
 // }
 
 // pub const SUPERVISOR_UART: Uart = Uart {
-//     base: 0xE000_1000 as *mut u32,
+//     base: 0xF000_1000 as *mut u32,
 // };
 
 // impl Uart {
@@ -751,8 +738,12 @@ fn stage2(cfg: &mut BootConfig) -> ! {
 // }
 
 // fn print_pagetable(root: u32) {
-//     sprintln!("Memory Maps (SATP: {:08x}  Root: {:08x}):", root, root<<12);
-//     let l1_pt = unsafe { &mut (*((root<<12) as *mut PageTable)) };
+//     sprintln!(
+//         "Memory Maps (SATP: {:08x}  Root: {:08x}):",
+//         root,
+//         root << 12
+//     );
+//     let l1_pt = unsafe { &mut (*((root << 12) as *mut PageTable)) };
 //     for (i, l1_entry) in l1_pt.entries.iter().enumerate() {
 //         if *l1_entry == 0 {
 //             continue;

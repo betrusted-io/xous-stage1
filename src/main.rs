@@ -362,7 +362,7 @@ impl BootConfig {
     fn get_top(&self) -> *mut usize {
         unsafe {
             self.sram_start
-                .add((self.sram_size - self.init_size - self.extra_pages * PAGE_SIZE) as usize / 4)
+                .add((self.sram_size - self.init_size - self.extra_pages * PAGE_SIZE) / 4)
         }
     }
 
@@ -373,12 +373,12 @@ impl BootConfig {
         let pg = self.get_top();
         unsafe {
             // Grab the page address and zero it out
-            bzero(pg as *mut u32, pg.add(PAGE_SIZE as usize / 4) as *mut u32);
+            bzero(pg as *mut usize, pg.add(PAGE_SIZE / 4) as *mut usize);
         }
         // Mark this page as in-use by the kernel
         let extra_bytes = self.extra_pages * PAGE_SIZE;
         self.runtime_page_tracker
-            [((self.sram_size - (extra_bytes + self.init_size)) / PAGE_SIZE) as usize] = 1;
+            [(self.sram_size - (extra_bytes + self.init_size)) / PAGE_SIZE] = 1;
 
         // Return the address
         pg as *mut usize
@@ -388,7 +388,7 @@ impl BootConfig {
         // First, check to see if the region is in RAM,
         if addr >= self.sram_start as usize && addr < self.sram_start as usize + self.sram_size {
             // Mark this page as in-use by the kernel
-            self.runtime_page_tracker[((addr - self.sram_start as usize) / PAGE_SIZE)] = pid;
+            self.runtime_page_tracker[(addr - self.sram_start as usize) / PAGE_SIZE] = pid;
             return;
         }
 
@@ -400,9 +400,9 @@ impl BootConfig {
             if addr >= region.start as usize
                 && addr < region.start as usize + region.length as usize
             {
-                self.runtime_page_tracker[(runtime_page_tracker_len
-                    + ((addr - region.start as usize) / PAGE_SIZE))
-                    as usize] = pid;
+                self.runtime_page_tracker[runtime_page_tracker_len
+                    + ((addr - region.start as usize) / PAGE_SIZE)
+                    ] = pid;
                 return;
             }
             runtime_page_tracker_len +=
@@ -487,14 +487,14 @@ fn allocate_regions(cfg: &mut BootConfig) {
     unsafe {
         bzero(
             runtime_page_tracker,
-            runtime_page_tracker.add((runtime_page_tracker_len / 4) as usize),
+            runtime_page_tracker.add(runtime_page_tracker_len / 4),
         );
     }
 
     cfg.runtime_page_tracker = unsafe {
         slice::from_raw_parts_mut(
             runtime_page_tracker as *mut XousPid,
-            runtime_page_tracker_len as usize,
+            runtime_page_tracker_len,
         )
     };
 }
@@ -682,13 +682,13 @@ fn stage2(cfg: &mut BootConfig) -> ! {
     // print_pagetable(cfg.processes[1].satp);
 
     let arg_offset = cfg.args_base as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
-    let ss_offset = cfg.processes.as_ptr() as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
+    let ip_offset = cfg.processes.as_ptr() as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     let rpt_offset =
         cfg.runtime_page_tracker.as_ptr() as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     unsafe {
         start_kernel(
             arg_offset,
-            ss_offset,
+            ip_offset,
             rpt_offset,
             cfg.processes[0].satp,
             cfg.processes[0].entrypoint,
@@ -702,7 +702,7 @@ fn stage2(cfg: &mut BootConfig) -> ! {
 // }
 
 // pub const SUPERVISOR_UART: Uart = Uart {
-//     base: 0xF000_2000 as *mut u32,
+//     base: 0xE000_1000 as *mut u32,
 // };
 
 // impl Uart {

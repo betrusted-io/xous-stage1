@@ -4,13 +4,15 @@ pub struct KernelArguments {
 
 pub struct KernelArgumentsIterator {
     base: *const u32,
-    size: u32,
+    size: usize,
     offset: u32,
 }
 
 impl KernelArguments {
-    pub fn new(base: *const u32) -> Self {
-        KernelArguments { base }
+    pub fn new(base: *const usize) -> Self {
+        KernelArguments {
+            base: base as *const u32,
+        }
     }
 
     pub fn iter(&self) -> KernelArgumentsIterator {
@@ -21,8 +23,9 @@ impl KernelArguments {
         }
     }
 
-    pub fn size(&self) -> u32 {
-        unsafe { self.base.add(2).read() * 4 as u32 }
+    pub fn size(&self) -> usize {
+        let s = unsafe { self.base.add(2).read() * 4 };
+        s as usize
     }
 }
 
@@ -54,7 +57,7 @@ impl KernelArgument {
 impl Iterator for KernelArgumentsIterator {
     type Item = KernelArgument;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.offset >= self.size {
+        if self.offset as usize >= self.size {
             None
         } else {
             let new_arg = KernelArgument::new(self.base, self.offset);

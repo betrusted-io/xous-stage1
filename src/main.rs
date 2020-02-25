@@ -7,27 +7,28 @@ use args::KernelArguments;
 use core::{mem, ptr, slice};
 
 pub type XousPid = u8;
-const PAGE_SIZE: u32 = 4096;
+const PAGE_SIZE: usize = 4096;
 
-const USER_STACK_OFFSET: u32 = 0xdfff_fffc;
-const PAGE_TABLE_OFFSET: u32 = 0x0040_0000;
-const PAGE_TABLE_ROOT_OFFSET: u32 = 0x0080_0000;
-const USER_AREA_START: u32 = 0x00c0_0000;
+const USER_STACK_OFFSET: usize = 0xdfff_fffc;
+const PAGE_TABLE_OFFSET: usize = 0x0040_0000;
+const PAGE_TABLE_ROOT_OFFSET: usize = 0x0080_0000;
+const CONTEXT_OFFSET: usize = 0x0080_1000;
+const USER_AREA_START: usize = 0x00c0_0000;
 
 // All of the kernel structures must live within Megapage 0,
 // and therefore are limited to 4 MB.
-const EXCEPTION_STACK_OFFSET: u32 = 0x003f_fffc;
-const KERNEL_LOAD_OFFSET: u32 = 0x0020_0000;
-const KERNEL_ARGUMENT_OFFSET: u32 = 0x0010_0000;
+const EXCEPTION_STACK_OFFSET: usize = 0x003f_fffc;
+const KERNEL_LOAD_OFFSET: usize = 0x0020_0000;
+const KERNEL_ARGUMENT_OFFSET: usize = 0x0010_0000;
 
-const FLG_VALID: u32 = 0x1;
-const FLG_X: u32 = 0x8;
-const FLG_W: u32 = 0x4;
-const FLG_R: u32 = 0x2;
-const FLG_U: u32 = 0x10;
-const FLG_A: u32 = 0x40;
-const FLG_D: u32 = 0x80;
-const STACK_PAGE_COUNT: u32 = 1;
+const FLG_VALID: usize = 0x1;
+const FLG_X: usize = 0x8;
+const FLG_W: usize = 0x4;
+const FLG_R: usize = 0x2;
+const FLG_U: usize = 0x10;
+const FLG_A: usize = 0x40;
+const FLG_D: usize = 0x80;
+const STACK_PAGE_COUNT: usize = 1;
 
 use core::panic::PanicInfo;
 #[panic_handler]
@@ -60,30 +61,30 @@ struct BootConfig {
     no_copy: bool,
 
     /// Base load address.  Defaults to the start of the args block
-    base_addr: *const u32,
+    base_addr: *const usize,
 
     /// Where the tagged args lsit starts in RAM.
-    args_base: *const u32,
+    args_base: *const usize,
 
     /// Additional memory regions in this system
     regions: &'static [MemoryRegionExtra],
 
     /// The origin of usable memory.  This is where heap lives.
-    sram_start: *mut u32,
+    sram_start: *mut usize,
 
     /// The size (in bytes) of the heap.
-    sram_size: u32,
+    sram_size: usize,
 
     /// A running total of the number of bytes consumed during
     /// initialization.  This value, divided by PAGE_SIZE,
     /// indicates the number of pages at the end of RAM that
     /// will need to be owned by the kernel.
-    init_size: u32,
+    init_size: usize,
 
     /// Additional pages that are consumed during init.
     /// This includes pages that are allocated to other
     /// processes.
-    extra_pages: u32,
+    extra_pages: usize,
 
     /// This structure keeps track of which pages are owned
     /// and which are free. A PID of `0` indicates it's free.
@@ -94,27 +95,26 @@ struct BootConfig {
     processes: &'static mut [InitialProcess],
 
     /// The number of 'Init' tags discovered
-    init_process_count: u32,
+    init_process_count: usize,
 }
 
 /// A single RISC-V page table entry.  In order to resolve an address,
 /// we need two entries: the top level, followed by the lower level.
 struct PageTable {
-    entries: [u32; 1024],
+    entries: [usize; 1024],
 }
 
 #[repr(C)]
 struct InitialProcess {
     /// The RISC-V SATP value, which includes the offset of the root page
     /// table plus the process ID.
-    satp: u32,
+    satp: usize,
 
     /// Where execution begins
-    entrypoint: u32,
+    entrypoint: usize,
 
     /// Address of the top of the stack
-    sp: u32,
-
+    sp: usize,
 }
 
 /// This describes the kernel as well as initially-loaded processes
@@ -143,7 +143,14 @@ struct ProgramDescription {
 }
 
 extern "C" {
-    fn start_kernel(args: u32, ss: u32, rpt: u32, satp: u32, entrypoint: u32, stack: u32) -> !;
+    fn start_kernel(
+        args: usize,
+        ss: usize,
+        rpt: usize,
+        satp: usize,
+        entrypoint: usize,
+        stack: usize,
+    ) -> !;
 }
 
 impl ProgramDescription {
@@ -152,25 +159,20 @@ impl ProgramDescription {
     /// either on SPI flash or in RAM.  The `load_offset` argument
     /// that is passed in should be used instead of `self.load_offset`
     /// for this reason.
-    pub fn load(
-        &self,
-        allocator: &mut BootConfig,
-        load_offset: u32,
-        pid: XousPid,
-    ) {
+    pub fn load(&self, allocator: &mut BootConfig, load_offset: usize, pid: XousPid) {
         assert!(pid != 0);
         let pid_idx = (pid - 1) as usize;
         let is_kernel = pid == 1;
         let flag_defaults = FLG_R | FLG_W | if is_kernel { 0 } else { FLG_U };
         let stack_addr = USER_STACK_OFFSET;
         if is_kernel {
-            assert!(self.text_offset == KERNEL_LOAD_OFFSET);
-            assert!(self.text_offset + self.load_size < EXCEPTION_STACK_OFFSET);
-            assert!(self.data_offset + self.data_size < EXCEPTION_STACK_OFFSET);
-            assert!(self.data_offset >= KERNEL_LOAD_OFFSET);
+            assert!(self.text_offset as usize == KERNEL_LOAD_OFFSET);
+            assert!(((self.text_offset + self.load_size) as usize) < EXCEPTION_STACK_OFFSET);
+            assert!(((self.data_offset + self.data_size) as usize) < EXCEPTION_STACK_OFFSET);
+            assert!(self.data_offset as usize >= KERNEL_LOAD_OFFSET);
         } else {
-            assert!(self.text_offset >= USER_AREA_START);
-            assert!(self.data_offset >= USER_AREA_START);
+            assert!(self.text_offset as usize >= USER_AREA_START);
+            assert!(self.data_offset as usize >= USER_AREA_START);
         }
 
         // SATP must be nonzero
@@ -179,25 +181,24 @@ impl ProgramDescription {
         }
 
         // Allocate a page to handle the top-level memory translation
-        let satp_address = allocator.alloc() as u32;
+        let satp_address = allocator.alloc() as usize;
         allocator.change_owner(pid as XousPid, satp_address);
 
         // Turn the satp address into a pointer
         let satp = unsafe { &mut *(satp_address as *mut PageTable) };
         allocator.map_page(satp, satp_address, PAGE_TABLE_ROOT_OFFSET, FLG_R | FLG_W);
 
+        // Allocate context for this process
+        let context_address = allocator.alloc() as usize;
+        allocator.map_page(satp, context_address, CONTEXT_OFFSET, FLG_R | FLG_W);
+
         // Ensure the pagetables are mapped as well
-        let pt_addr = allocator.alloc() as u32;
-        allocator.map_page(
-            satp,
-            pt_addr,
-            PAGE_TABLE_OFFSET + 0,
-            FLG_R | FLG_W,
-        );
+        let pt_addr = allocator.alloc() as usize;
+        allocator.map_page(satp, pt_addr, PAGE_TABLE_OFFSET + 0, FLG_R | FLG_W);
 
         // Allocate stack pages.
         for i in 0..STACK_PAGE_COUNT {
-            let sp_page = allocator.alloc() as u32;
+            let sp_page = allocator.alloc() as usize;
             allocator.map_page(
                 satp,
                 sp_page,
@@ -208,7 +209,7 @@ impl ProgramDescription {
 
             // If it's the kernel, also allocate an exception page
             if is_kernel {
-                let sp_page = allocator.alloc() as u32;
+                let sp_page = allocator.alloc() as usize;
                 allocator.map_page(
                     satp,
                     sp_page,
@@ -219,42 +220,42 @@ impl ProgramDescription {
             }
         }
 
-        assert!((self.text_offset & (PAGE_SIZE - 1)) == 0);
-        assert!((self.data_offset & (PAGE_SIZE - 1)) == 0);
+        assert!((self.text_offset as usize & (PAGE_SIZE - 1)) == 0);
+        assert!((self.data_offset as usize & (PAGE_SIZE - 1)) == 0);
         if allocator.no_copy {
-            assert!((self.load_offset & (PAGE_SIZE - 1)) == 0);
+            assert!((self.load_offset as usize & (PAGE_SIZE - 1)) == 0);
         }
 
         // Map the process text section into RAM.
         // Either this is on SPI flash at an aligned address, or it
         // has been copied into RAM already.  This is why we ignore `self.load_offset`
         // and use the `load_offset` parameter instead.
-        for offset in (0..self.load_size).step_by(PAGE_SIZE as usize) {
+        for offset in (0..self.load_size as usize).step_by(PAGE_SIZE) {
             allocator.map_page(
                 satp,
                 load_offset + offset,
-                self.text_offset + offset,
+                self.text_offset as usize + offset,
                 flag_defaults | FLG_X,
             );
             allocator.change_owner(pid as XousPid, load_offset + offset);
         }
 
         // Map the process data section into RAM.
-        for offset in (0..self.data_size).step_by(PAGE_SIZE as usize) {
+        for offset in (0..self.data_size as usize).step_by(PAGE_SIZE as usize) {
             let page_addr = allocator.alloc();
             allocator.map_page(
                 satp,
-                page_addr as u32,
-                self.data_offset + offset,
+                page_addr as usize,
+                self.data_offset as usize + offset,
                 flag_defaults,
             );
-            allocator.change_owner(pid as XousPid, load_offset + offset);
+            allocator.change_owner(pid as XousPid, load_offset as usize + offset);
         }
 
         let ref mut process = allocator.processes[pid_idx];
-        process.entrypoint = self.entrypoint;
+        process.entrypoint = self.entrypoint as usize;
         process.sp = stack_addr;
-        process.satp = 0x80000000 | ((pid as u32) << 22) | (satp_address >> 12);
+        process.satp = 0x80000000 | ((pid as usize) << 22) | (satp_address >> 12);
     }
 }
 
@@ -288,8 +289,8 @@ fn read_initial_config(args: &KernelArguments, cfg: &mut BootConfig) {
     if xarg.name != make_type!("XArg") || xarg.size != 20 {
         panic!("XArg wasn't first tag, or was invalid size");
     }
-    cfg.sram_start = xarg.data[2] as *mut u32;
-    cfg.sram_size = xarg.data[3];
+    cfg.sram_start = xarg.data[2] as *mut usize;
+    cfg.sram_size = xarg.data[3] as usize;
 
     let mut kernel_seen = false;
     let mut init_seen = false;
@@ -308,7 +309,7 @@ fn read_initial_config(args: &KernelArguments, cfg: &mut BootConfig) {
                 cfg.no_copy = true;
             }
             if boot_flags & 2 != 0 {
-                cfg.base_addr = 0 as *const u32;
+                cfg.base_addr = 0 as *const usize;
             }
         } else if tag.name == make_type!("XKrn") {
             assert!(!kernel_seen, "kernel appears twice");
@@ -339,7 +340,7 @@ fn copy_processes(cfg: &mut BootConfig, args: &KernelArguments) {
             let prog = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
 
             // Round it off to a page boundary
-            let load_size_rounded = (prog.load_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            let load_size_rounded = (prog.load_size as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
             cfg.extra_pages += load_size_rounded / PAGE_SIZE;
             let top = cfg.get_top();
             unsafe {
@@ -358,7 +359,7 @@ fn copy_processes(cfg: &mut BootConfig, args: &KernelArguments) {
 }
 
 impl BootConfig {
-    fn get_top(&self) -> *mut u32 {
+    fn get_top(&self) -> *mut usize {
         unsafe {
             self.sram_start
                 .add((self.sram_size - self.init_size - self.extra_pages * PAGE_SIZE) as usize / 4)
@@ -367,7 +368,7 @@ impl BootConfig {
 
     /// Zero-alloc a new page, mark it as owned by PID1, and return it.
     /// Decrement the `next_page_offset` (npo) variable by one page.
-    pub fn alloc(&mut self) -> *mut u32 {
+    pub fn alloc(&mut self) -> *mut usize {
         self.extra_pages += 1;
         let pg = self.get_top();
         unsafe {
@@ -380,30 +381,32 @@ impl BootConfig {
             [((self.sram_size - (extra_bytes + self.init_size)) / PAGE_SIZE) as usize] = 1;
 
         // Return the address
-        pg as *mut u32
+        pg as *mut usize
     }
 
-    pub fn change_owner(&mut self, pid: XousPid, addr: u32) {
+    pub fn change_owner(&mut self, pid: XousPid, addr: usize) {
         // First, check to see if the region is in RAM,
-        if addr > self.sram_start as u32 && addr < self.sram_start as u32 + self.sram_size {
+        if addr >= self.sram_start as usize && addr < self.sram_start as usize + self.sram_size {
             // Mark this page as in-use by the kernel
-            self.runtime_page_tracker[((addr - self.sram_start as u32) / PAGE_SIZE) as usize] = pid;
+            self.runtime_page_tracker[((addr - self.sram_start as usize) / PAGE_SIZE)] = pid;
             return;
         }
 
         // The region isn't in RAM, so check the other memory regions.
         let mut runtime_page_tracker_len =
-            self.sram_size * mem::size_of::<XousPid>() as u32 / PAGE_SIZE;
+            self.sram_size * mem::size_of::<XousPid>() as usize / PAGE_SIZE;
 
         for region in self.regions.iter() {
-            if addr >= region.start && addr < region.start + region.length {
-                self.runtime_page_tracker
-                    [(runtime_page_tracker_len + ((addr - region.start) / PAGE_SIZE)) as usize] =
-                    pid;
+            if addr >= region.start as usize
+                && addr < region.start as usize + region.length as usize
+            {
+                self.runtime_page_tracker[(runtime_page_tracker_len
+                    + ((addr - region.start as usize) / PAGE_SIZE))
+                    as usize] = pid;
                 return;
             }
             runtime_page_tracker_len +=
-                region.length * mem::size_of::<XousPid>() as u32 / PAGE_SIZE;
+                region.length as usize * mem::size_of::<XousPid>() as usize / PAGE_SIZE;
         }
         panic!(
             "Tried to change region {:08x} that isn't in defined memory!",
@@ -417,7 +420,7 @@ impl BootConfig {
     /// # Panics
     ///
     /// * If you try to map a page twice
-    pub fn map_page(&mut self, root: &mut PageTable, phys: u32, virt: u32, flags: u32) {
+    pub fn map_page(&mut self, root: &mut PageTable, phys: usize, virt: usize, flags: usize) {
         let ppn1 = (phys >> 22) & ((1 << 12) - 1);
         let ppn0 = (phys >> 12) & ((1 << 10) - 1);
         let ppo = (phys >> 0) & ((1 << 12) - 1);
@@ -437,22 +440,22 @@ impl BootConfig {
         let mut new_addr = 0;
 
         // Allocate a new level 1 pagetable entry if one doesn't exist.
-        if l1_pt[vpn1 as usize] & FLG_VALID == 0 {
-            new_addr = self.alloc() as u32;
+        if l1_pt[vpn1] & FLG_VALID == 0 {
+            new_addr = self.alloc() as usize;
             // Mark this entry as a leaf node (WRX as 0), and indicate
             // it is a valid page by setting "V".
-            l1_pt[vpn1 as usize] = ((new_addr >> 12) << 10) | FLG_VALID;
+            l1_pt[vpn1] = ((new_addr >> 12) << 10) | FLG_VALID;
         }
 
         let l0_pt_idx =
-            unsafe { &mut (*(((l1_pt[vpn1 as usize] << 2) & !((1 << 12) - 1)) as *mut PageTable)) };
+            unsafe { &mut (*(((l1_pt[vpn1] << 2) & !((1 << 12) - 1)) as *mut PageTable)) };
         let ref mut l0_pt = l0_pt_idx.entries;
 
         // Ensure the entry hasn't already been mapped.
         // if l0_pt[vpn0 as usize] & 1 != 0 {
         //     panic!("Page already allocated!");
         // }
-        l0_pt[vpn0 as usize] = (ppn1 << 20) | (ppn0 << 10) | flags | FLG_VALID | FLG_D | FLG_A;
+        l0_pt[vpn0] = (ppn1 << 20) | (ppn0 << 10) | flags | FLG_VALID | FLG_D | FLG_A;
 
         // If we had to allocate a level 1 pagetable entry, ensure that it's
         // mapped into our address space.
@@ -471,13 +474,11 @@ impl BootConfig {
 /// Returns a pointer to the start of the memory region.
 fn allocate_regions(cfg: &mut BootConfig) {
     // Number of individual pages in the system
-    let mut runtime_page_tracker_len =
-        cfg.sram_size as u32 * mem::size_of::<XousPid>() as u32 / PAGE_SIZE;
+    let mut runtime_page_tracker_len = cfg.sram_size * mem::size_of::<XousPid>() / PAGE_SIZE;
 
     for region in cfg.regions.iter() {
-        let region_length_rounded = (region.length + 4096 - 1) & !(4096 - 1);
-        runtime_page_tracker_len +=
-            region_length_rounded * mem::size_of::<XousPid>() as u32 / PAGE_SIZE;
+        let region_length_rounded = (region.length as usize + 4096 - 1) & !(4096 - 1);
+        runtime_page_tracker_len += region_length_rounded * mem::size_of::<XousPid>() / PAGE_SIZE;
     }
     cfg.init_size += runtime_page_tracker_len;
 
@@ -500,24 +501,25 @@ fn allocate_regions(cfg: &mut BootConfig) {
 
 fn allocate_processes(cfg: &mut BootConfig) {
     let process_count = cfg.init_process_count + 1;
-    let table_size = process_count * mem::size_of::<InitialProcess>() as u32;
+    let table_size = process_count * mem::size_of::<InitialProcess>();
     // Allocate the process table
     cfg.init_size += table_size;
     let processes = cfg.get_top();
     unsafe {
         bzero(processes, processes.add((table_size / 4) as usize));
     }
-    cfg.processes =
-        unsafe { slice::from_raw_parts_mut(processes as *mut InitialProcess, process_count as usize) };
+    cfg.processes = unsafe {
+        slice::from_raw_parts_mut(processes as *mut InitialProcess, process_count as usize)
+    };
 }
 
 fn allocate_config(cfg: &mut BootConfig) -> &mut BootConfig {
-    cfg.init_size += mem::size_of::<BootConfig>() as u32;
+    cfg.init_size += mem::size_of::<BootConfig>();
     let top = cfg.get_top();
     unsafe {
         memcpy(
             top,
-            cfg as *const BootConfig as *const u32,
+            cfg as *const BootConfig as *const usize,
             mem::size_of::<BootConfig>(),
         )
     };
@@ -528,7 +530,13 @@ fn copy_args(cfg: &mut BootConfig, args: &KernelArguments) {
     // Copy the args list to target RAM
     cfg.init_size += args.size();
     let runtime_arg_buffer = cfg.get_top();
-    unsafe { memcpy(runtime_arg_buffer, args.base, args.size() as usize) };
+    unsafe {
+        memcpy(
+            runtime_arg_buffer,
+            args.base as *const usize,
+            args.size() as usize,
+        )
+    };
     cfg.args_base = runtime_arg_buffer;
 }
 
@@ -537,7 +545,7 @@ fn copy_args(cfg: &mut BootConfig, args: &KernelArguments) {
 /// and copying the arguments to RAM.
 /// Assume the bootloader has already set up the stack to point to the end of RAM.
 #[export_name = "rust_entry"]
-pub unsafe extern "C" fn rust_entry(arg_buffer: *const u32, signature: u32) -> ! {
+pub unsafe extern "C" fn rust_entry(arg_buffer: *const usize, signature: u32) -> ! {
     stage1(KernelArguments::new(arg_buffer), signature);
 }
 
@@ -546,11 +554,11 @@ fn stage1(args: KernelArguments, _signature: u32) -> ! {
     // where in heap this memory will go.
     let mut cfg = BootConfig {
         no_copy: false,
-        base_addr: args.base,
+        base_addr: args.base as *const usize,
         regions: Default::default(),
-        sram_start: 0 as *mut u32,
+        sram_start: 0 as *mut usize,
         sram_size: 0,
-        args_base: args.base,
+        args_base: args.base as *const usize,
         init_size: 0,
         extra_pages: 0,
         runtime_page_tracker: Default::default(),
@@ -600,7 +608,7 @@ fn stage1(args: KernelArguments, _signature: u32) -> ! {
     // Note also that we skip the first index, causing the stack to be
     // returned to the process pool.
     for i in 1..(cfg.init_size / PAGE_SIZE) {
-        cfg.runtime_page_tracker[(cfg.runtime_page_tracker.len() as u32 - 1 - i) as usize] = 1;
+        cfg.runtime_page_tracker[cfg.runtime_page_tracker.len() - 1 - i] = 1;
     }
 
     stage2(&mut cfg);
@@ -612,7 +620,7 @@ fn stage2(cfg: &mut BootConfig) -> ! {
     let args = KernelArguments::new(cfg.args_base);
 
     // This is the offset in RAM where programs are loaded from.
-    let mut process_offset = cfg.sram_start as u32 + cfg.sram_size - cfg.init_size;
+    let mut process_offset = cfg.sram_start as usize + cfg.sram_size - cfg.init_size;
 
     // Go through all Init processes and the kernel, setting up their
     // page tables and mapping memory to them.
@@ -620,30 +628,22 @@ fn stage2(cfg: &mut BootConfig) -> ! {
     for tag in args.iter() {
         if tag.name == make_type!("Init") {
             let init = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
-            let load_size_rounded = (init.load_size + 4096 - 1) & !(4096 - 1);
-            init.load(
-                cfg,
-                process_offset - load_size_rounded,
-                pid,
-            );
+            let load_size_rounded = (init.load_size as usize + 4096 - 1) & !(4096 - 1);
+            init.load(cfg, process_offset - load_size_rounded, pid);
             pid += 1;
             process_offset -= load_size_rounded;
         } else if tag.name == make_type!("XKrn") {
             let xkrn = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
-            let load_size_rounded = (xkrn.load_size + 4096 - 1) & !(4096 - 1);
-            xkrn.load(
-                cfg,
-                process_offset - load_size_rounded,
-                1,
-            );
+            let load_size_rounded = (xkrn.load_size as usize + 4096 - 1) & !(4096 - 1);
+            xkrn.load(cfg, process_offset - load_size_rounded, 1);
             process_offset -= load_size_rounded;
         }
     }
 
-    let krn_struct_start = cfg.sram_start as u32 + cfg.sram_size - cfg.init_size;
+    let krn_struct_start = cfg.sram_start as usize + cfg.sram_size - cfg.init_size;
     let krn_l1_pt_addr = cfg.processes[0].satp << 12;
     assert!(krn_struct_start & (4096 - 1) == 0);
-    let krn_pg0_ptr = unsafe { (krn_l1_pt_addr as *const u32).read() };
+    let krn_pg0_ptr = unsafe { (krn_l1_pt_addr as *const usize).read() };
 
     // Map boot-generated kernel structures into the kernel
     let satp = unsafe { &mut *(krn_l1_pt_addr as *mut PageTable) };
@@ -663,7 +663,7 @@ fn stage2(cfg: &mut BootConfig) -> ! {
     // the one address to get all 4MB mapped.
     for process in cfg.processes[1..].iter() {
         let l1_pt_addr = process.satp << 12;
-        unsafe { (l1_pt_addr as *mut u32).write(krn_pg0_ptr) };
+        unsafe { (l1_pt_addr as *mut usize).write(krn_pg0_ptr) };
     }
 
     // // XXX FIXME As a test, map the UART to PID1
@@ -681,10 +681,10 @@ fn stage2(cfg: &mut BootConfig) -> ! {
     // sprintln!("PID2 pagetables:");
     // print_pagetable(cfg.processes[1].satp);
 
-    let arg_offset = cfg.args_base as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
-    let ss_offset = cfg.processes.as_ptr() as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
+    let arg_offset = cfg.args_base as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
+    let ss_offset = cfg.processes.as_ptr() as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     let rpt_offset =
-        cfg.runtime_page_tracker.as_ptr() as u32 - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
+        cfg.runtime_page_tracker.as_ptr() as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     unsafe {
         start_kernel(
             arg_offset,

@@ -97,6 +97,24 @@ pub struct BootConfig {
     init_process_count: usize,
 }
 
+impl Default for BootConfig {
+    fn default() -> BootConfig {
+        BootConfig {
+            no_copy: false,
+            base_addr: 0 as *const usize,
+            regions: Default::default(),
+            sram_start: 0 as *mut usize,
+            sram_size: 0,
+            args_base: 0 as *const usize,
+            init_size: 0,
+            extra_pages: 0,
+            runtime_page_tracker: Default::default(),
+            init_process_count: 0,
+            processes: Default::default(),
+        }
+    }
+}
+
 /// A single RISC-V page table entry.  In order to resolve an address,
 /// we need two entries: the top level, followed by the lower level.
 pub struct PageTable {
@@ -282,7 +300,7 @@ where
     }
 }
 
-fn read_initial_config(args: &KernelArguments, cfg: &mut BootConfig) {
+pub fn read_initial_config(cfg: &mut BootConfig, args: &KernelArguments) {
     let mut i = args.iter();
     let xarg = i.next().expect("couldn't read initial tag");
     if xarg.name != make_type!("XArg") || xarg.size != 20 {
@@ -537,19 +555,11 @@ fn stage1(args: KernelArguments, _signature: u32) -> ! {
     // Store the initial boot config on the stack.  We don't know
     // where in heap this memory will go.
     let mut cfg = BootConfig {
-        no_copy: false,
         base_addr: args.base as *const usize,
-        regions: Default::default(),
-        sram_start: 0 as *mut usize,
-        sram_size: 0,
         args_base: args.base as *const usize,
-        init_size: 0,
-        extra_pages: 0,
-        runtime_page_tracker: Default::default(),
-        init_process_count: 0,
-        processes: Default::default(),
+        ..Default::default()
     };
-    read_initial_config(&args, &mut cfg);
+    read_initial_config(&mut cfg, &args);
 
     // Allocate space for the stack pointer.
     // The bootloader should have placed the stack pointer at the end of RAM

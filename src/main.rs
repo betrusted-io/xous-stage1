@@ -1,6 +1,7 @@
 #![cfg_attr(not(test), no_main)]
 #![cfg_attr(not(test), no_std)]
 
+#[macro_use]
 mod args;
 use args::KernelArguments;
 
@@ -43,15 +44,6 @@ mod panic_handler {
 
 #[cfg(test)]
 mod test;
-
-/// Convert a four-letter string into a 32-bit int.
-macro_rules! make_type {
-    ($fcc:expr) => {{
-        let mut c: [u8; 4] = Default::default();
-        c.copy_from_slice($fcc.as_bytes());
-        u32::from_le_bytes(c)
-    }};
-}
 
 #[repr(C)]
 struct MemoryRegionExtra {

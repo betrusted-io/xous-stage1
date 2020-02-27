@@ -1,5 +1,5 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_main)]
+#![cfg_attr(not(test), no_std)]
 
 mod args;
 use args::KernelArguments;
@@ -30,12 +30,19 @@ const FLG_A: usize = 0x40;
 const FLG_D: usize = 0x80;
 const STACK_PAGE_COUNT: usize = 1;
 
-use core::panic::PanicInfo;
-#[panic_handler]
-fn handle_panic(_arg: &PanicInfo) -> ! {
-    // sprintln!("{}", _arg);
-    loop {}
+// Install a panic handler when not running tests.
+#[cfg(not(test))]
+mod panic_handler {
+    use core::panic::PanicInfo;
+    #[panic_handler]
+    fn handle_panic(_arg: &PanicInfo) -> ! {
+        // sprintln!("{}", _arg);
+        loop {}
+    }
 }
+
+#[cfg(test)]
+mod test;
 
 /// Convert a four-letter string into a 32-bit int.
 macro_rules! make_type {

@@ -55,7 +55,7 @@ struct MemoryRegionExtra {
 
 /// In-memory copy of the configuration page,
 /// used by the stage-1 bootloader.
-struct BootConfig {
+pub struct BootConfig {
     /// `true` if the kernel and Init programs run XIP
     no_copy: bool,
 
@@ -99,12 +99,12 @@ struct BootConfig {
 
 /// A single RISC-V page table entry.  In order to resolve an address,
 /// we need two entries: the top level, followed by the lower level.
-struct PageTable {
+pub struct PageTable {
     entries: [usize; 1024],
 }
 
 #[repr(C)]
-struct InitialProcess {
+pub struct InitialProcess {
     /// The RISC-V SATP value, which includes the offset of the root page
     /// table plus the process ID.
     satp: usize,

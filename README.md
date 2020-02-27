@@ -8,12 +8,13 @@ This program runs in **Machine** mode and has access to the entire system.  When
 
 ## Building
 
-To build the stage-1 module, you will need a basic `riscv32i-unknown-none-elf` target for Rust.
+To build the stage-1 module, you will need a `riscv32i-unknown-none-elf` or `riscv32imac-unknown-none-elf` target for Rust.
 
-1. Get Rust.  Go to https://rustup.rs/ and follow its instructions.
-2. Install the proper toolchain: `rustup target add riscv32i-unknown-none-elf`
-3. Build the stage-1 loader: `cargo build --release`
-4. Get an executable binary: `riscv64-unknown-elf-gcc -O binary target/riscv32i-unknown-none-elf/xous-stage1 xous-stage1.bin`
+1. Decide what target you want.  For simple, embedded systems this could be `riscv32i-unknown-none-elf`, and for more complex systems with compressed instructions you could use `riscv32imac-unknown-none-elf`.
+2. Get Rust.  Go to https://rustup.rs/ and follow its instructions.
+3. Install the proper toolchain: `rustup target add ${target_arch}`
+4. Build the stage-1 loader: `cargo build --release --target ${target_arch}`
+5. Get an executable binary: `riscv64-unknown-elf-gcc -O binary target/${target}/xous-stage1 xous-stage1.bin`
 
 ## Using
 
@@ -39,7 +40,25 @@ There is no additional setup required.
 
 ## Testing
 
-_TBD_
+To run tests, use `cargo --test`.  For example:
+
+```sh
+$ cargo test
+   Compiling lazy_static v1.4.0
+   Compiling xous-stage1 v0.1.0 (D:\\Code\\Xous\\stage1)
+    Finished test [unoptimized + debuginfo] target(s) in 6.32s
+     Running target\\debug\\deps\\xous_stage1-cc47f958323f51ed.exe
+
+running 4 tests
+test test::allocate_regions ... ok
+test test::copy_processes ... ok
+test test::parse_args_bin ... ok
+test test::read_initial_config ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+$
+```
 
 ## Contribution Guidelines
 

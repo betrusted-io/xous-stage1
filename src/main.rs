@@ -484,7 +484,7 @@ impl BootConfig {
 
 /// Allocate and initialize memory regions.
 /// Returns a pointer to the start of the memory region.
-fn allocate_regions(cfg: &mut BootConfig) {
+pub fn allocate_regions(cfg: &mut BootConfig) {
     // Number of individual pages in the system
     let mut rpt_pages = cfg.sram_size / PAGE_SIZE;
 
@@ -514,7 +514,7 @@ fn allocate_regions(cfg: &mut BootConfig) {
         unsafe { slice::from_raw_parts_mut(runtime_page_tracker as *mut XousPid, rpt_pages) };
 }
 
-fn allocate_processes(cfg: &mut BootConfig) {
+pub fn allocate_processes(cfg: &mut BootConfig) {
     let process_count = cfg.init_process_count + 1;
     let table_size = process_count * mem::size_of::<InitialProcess>();
     // Allocate the process table
@@ -528,7 +528,7 @@ fn allocate_processes(cfg: &mut BootConfig) {
     };
 }
 
-fn copy_args(cfg: &mut BootConfig, args: &KernelArguments) {
+pub fn copy_args(cfg: &mut BootConfig, args: &KernelArguments) {
     // Copy the args list to target RAM
     cfg.init_size += args.size();
     let runtime_arg_buffer = cfg.get_top();

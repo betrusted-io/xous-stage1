@@ -1,5 +1,6 @@
 use lazy_static::lazy_static;
 
+use crate::BootConfig;
 use std::sync::Mutex;
 
 fn get_args_bin() -> &'static [u8] {
@@ -7,7 +8,8 @@ fn get_args_bin() -> &'static [u8] {
 }
 
 const REGION_COUNT: usize = 8;
-static mut MEMORY_REGIONS: [[usize; 1024 * 1024]; REGION_COUNT] = [[0usize; 1024 * 1024]; REGION_COUNT];
+static mut MEMORY_REGIONS: [[usize; 1024 * 1024]; REGION_COUNT] =
+    [[0usize; 1024 * 1024]; REGION_COUNT];
 lazy_static! {
     static ref REGIONS_CHECKED_OUT: Mutex<[bool; REGION_COUNT]> = Mutex::new([false; REGION_COUNT]);
 }
@@ -49,56 +51,70 @@ impl Drop for FakeMemory {
     }
 }
 
+struct TestEnvironment {
+    pub cfg: BootConfig,
+    _mem: FakeMemory,
+}
+
+impl TestEnvironment {
+    pub fn new() -> TestEnvironment {
+        use crate::args::KernelArguments;
+
+        // Create a fake memory block into which the bootloader will write
+        let fake_memory = FakeMemory::get();
+        // use rand::prelude::*;
+        // for mem in fake_memory.region.iter_mut() {
+        //     *mem = random();
+        // }
+
+        let args = get_args_bin();
+        let ka = KernelArguments::new(args.as_ptr() as *const usize);
+        let mut cfg = BootConfig {
+            args: ka,
+            base_addr: ka.base as *const usize,
+            ..Default::default()
+        };
+        crate::read_initial_config(&mut cfg);
+
+        // Patch up the config memory address.  Ensure the range is on a "page" boundary.
+        let raw_ptr = fake_memory.region.as_mut_ptr() as usize;
+        let raw_ptr_rounded = (raw_ptr + crate::PAGE_SIZE - 1) & !(crate::PAGE_SIZE - 1);
+
+        cfg.sram_start = raw_ptr_rounded as *mut _;
+        cfg.sram_size = fake_memory.region.len() * core::mem::size_of::<usize>() - crate::PAGE_SIZE;
+
+        println!(
+            "Patching RAM so it starts at {:016x} and is {} bytes long",
+            fake_memory.region.as_ptr() as usize,
+            fake_memory.region.len() * core::mem::size_of::<usize>()
+        );
+
+        TestEnvironment {
+            cfg,
+            _mem: fake_memory,
+        }
+    }
+}
+
 #[test]
 fn copy_processes() {
-    use crate::args::KernelArguments;
-    use crate::BootConfig;
-
-    // Create a fake memory block into which the bootloader will write
-    let fake_memory = FakeMemory::get();
-
-    let args = get_args_bin();
-    let ka = KernelArguments::new(args.as_ptr() as *const usize);
-    let mut cfg = BootConfig {
-        args: ka,
-        base_addr: ka.base as *const usize,
-        ..Default::default()
-    };
-    crate::read_initial_config(&mut cfg);
-
-    // Patch up the config memory address
-    cfg.sram_start = fake_memory.region.as_ptr() as *mut _;
-    cfg.sram_size = fake_memory.region.len() / core::mem::size_of::<usize>();
-    crate::copy_processes(&mut cfg);
+    let mut env = TestEnvironment::new();
+    crate::copy_processes(&mut env.cfg);
 }
 
 #[test]
 fn allocate_regions() {
-    use crate::args::KernelArguments;
-    use crate::BootConfig;
-
-    // Create a fake memory block into which the bootloader will write
-    let fake_memory = FakeMemory::get();
-
-    let args = get_args_bin();
-    let ka = KernelArguments::new(args.as_ptr() as *const usize);
-    let mut cfg = BootConfig {
-        args: ka,
-        base_addr: ka.base as *const usize,
-        ..Default::default()
-    };
-    crate::read_initial_config(&mut cfg);
-
-    // Patch up the config memory address
-    cfg.sram_start = fake_memory.region.as_ptr() as *mut _;
-    cfg.sram_size = fake_memory.region.len() / core::mem::size_of::<usize>();
+    let mut env = TestEnvironment::new();
+    crate::copy_processes(&mut env.cfg);
 
     // The first region is defined as being "main RAM", which will be used
     // to keep track of allocations.
-    crate::allocate_regions(&mut cfg);
+    println!("Allocating regions");
+    crate::allocate_regions(&mut env.cfg);
 
     // The kernel, as well as initial processes, are all stored in RAM.
-    crate::allocate_processes(&mut cfg);
+    println!("Allocating processes");
+    crate::allocate_processes(&mut env.cfg);
 }
 
 #[test]
@@ -136,16 +152,48 @@ fn read_initial_config() {
     use crate::args::KernelArguments;
     use crate::BootConfig;
 
-    // Create a fake memory block into which the bootloader will write
-    // let mut fake_memory = [0usize; 1024 * 128];
-
     let args = get_args_bin();
     let ka = KernelArguments::new(args.as_ptr() as *const usize);
     let mut cfg = BootConfig {
         args: ka,
+        base_addr: ka.base as *const usize,
         ..Default::default()
     };
     crate::read_initial_config(&mut cfg);
+}
+
+#[test]
+fn full_boot() {
+    let mut env = TestEnvironment::new();
+
+    println!("Running phase_1");
+    crate::phase_1(&mut env.cfg);
+    println!("Running phase_2");
+    crate::phase_2(&mut env.cfg);
+    println!("Done with phases");
+}
+
+#[test]
+fn tracker_sane() {
+    let mut env = TestEnvironment::new();
+
+    crate::phase_1(&mut env.cfg);
+    crate::phase_2(&mut env.cfg);
+
+    let mut max_pid = 0;
+    for process in env.cfg.processes.iter() {
+        let satp = process.satp;
+        let pid = (satp >> 22 & ((1<<9) - 1)) as u8;
+        if pid > max_pid {
+            max_pid = pid;
+        }
+        let mem_base = satp << 12;
+        println!("Process {} @ {:08x} ({:08x}), entrypoint {:08x}, sp {:08x}", pid, mem_base, satp, process.entrypoint, process.sp);
+    }
+
+    for (idx, addr) in env.cfg.runtime_page_tracker.iter().enumerate() {
+        assert!(*addr <= max_pid, "runtime page tracker contains invalid values @ {} ({:08x})! {} > {}", idx, addr as *const u8 as usize, *addr, max_pid);
+    }
 }
 
 // Create a fake "start_kernel" function to allow
@@ -159,5 +207,5 @@ pub unsafe extern "C" fn start_kernel(
     _entrypoint: usize,
     _stack: usize,
 ) -> ! {
-    loop {};
+    loop {}
 }

@@ -9,6 +9,10 @@ description = "Stage 1 loader for Xous"
 
 [dev-dependencies]
 lazy_static = "1.4.0"
+rand = "0.7.3"
+
+[features]
+debug-print = []
 
 [profile.release]
 codegen-units = 1 # 1 better optimizations

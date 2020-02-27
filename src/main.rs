@@ -8,7 +8,8 @@ use args::KernelArguments;
 use core::{mem, ptr, slice};
 
 pub type XousPid = u8;
-const PAGE_SIZE: usize = 4096;
+pub const PAGE_SIZE: usize = 4096;
+const WORD_SIZE: usize = mem::size_of::<usize>();
 
 const USER_STACK_OFFSET: usize = 0xdfff_fffc;
 const PAGE_TABLE_OFFSET: usize = 0x0040_0000;
@@ -30,6 +31,8 @@ const FLG_U: usize = 0x10;
 const FLG_A: usize = 0x40;
 const FLG_D: usize = 0x80;
 const STACK_PAGE_COUNT: usize = 1;
+
+mod debug;
 
 // Install a panic handler when not running tests.
 #[cfg(not(test))]
@@ -117,8 +120,9 @@ impl Default for BootConfig {
 
 /// A single RISC-V page table entry.  In order to resolve an address,
 /// we need two entries: the top level, followed by the lower level.
+#[repr(C)]
 pub struct PageTable {
-    entries: [usize; 1024],
+    entries: [usize; PAGE_SIZE / WORD_SIZE],
 }
 
 #[repr(C)]
@@ -135,6 +139,7 @@ pub struct InitialProcess {
 }
 
 /// This describes the kernel as well as initially-loaded processes
+#[repr(C)]
 struct ProgramDescription {
     /// Physical source address of this program in RAM (i.e. SPI flash)
     load_offset: u32,
@@ -178,6 +183,7 @@ impl ProgramDescription {
     /// for this reason.
     pub fn load(&self, allocator: &mut BootConfig, load_offset: usize, pid: XousPid) {
         assert!(pid != 0);
+        println!("Loading program {} into offset {:08x}", pid, load_offset);
         let pid_idx = (pid - 1) as usize;
         let is_kernel = pid == 1;
         let flag_defaults = FLG_R | FLG_W | if is_kernel { 0 } else { FLG_U };
@@ -198,10 +204,13 @@ impl ProgramDescription {
         }
 
         // Allocate a page to handle the top-level memory translation
+        println!("Allocating");
         let satp_address = allocator.alloc() as usize;
+        println!("Changing owner");
         allocator.change_owner(pid as XousPid, satp_address);
 
         // Turn the satp address into a pointer
+        println!("Mapping thingy");
         let satp = unsafe { &mut *(satp_address as *mut PageTable) };
         allocator.map_page(satp, satp_address, PAGE_TABLE_ROOT_OFFSET, FLG_R | FLG_W);
 
@@ -219,7 +228,7 @@ impl ProgramDescription {
             allocator.map_page(
                 satp,
                 sp_page,
-                (stack_addr - 4096 * i) & !(PAGE_SIZE - 1),
+                (stack_addr - PAGE_SIZE * i) & !(PAGE_SIZE - 1),
                 flag_defaults,
             );
             allocator.change_owner(pid as XousPid, sp_page);
@@ -230,7 +239,7 @@ impl ProgramDescription {
                 allocator.map_page(
                     satp,
                     sp_page,
-                    (EXCEPTION_STACK_OFFSET - 4096 * i) & !(PAGE_SIZE - 1),
+                    (EXCEPTION_STACK_OFFSET - PAGE_SIZE * i) & !(PAGE_SIZE - 1),
                     flag_defaults,
                 );
                 allocator.change_owner(pid as XousPid, sp_page);
@@ -363,13 +372,14 @@ fn copy_processes(cfg: &mut BootConfig) {
             let top = cfg.get_top();
             unsafe {
                 // Copy the program to the target address, rounding it off to the load size.
-                let src_addr = cfg.base_addr.add(prog.load_offset as usize / 4);
+                let src_addr = cfg.base_addr.add(prog.load_offset as usize / mem::size_of::<usize>());
+                println!("Loading from {:08x} to {:08x} ({} bytes long)", src_addr as usize, top as usize, prog.load_size);
                 memcpy(top, src_addr, prog.load_size as usize);
 
                 // Zero out the remaining data.
                 bzero(
-                    top.add(prog.load_size as usize / 4),
-                    top.add(load_size_rounded as usize / 4),
+                    top.add(prog.load_size as usize / mem::size_of::<usize>()),
+                    top.add(load_size_rounded as usize / mem::size_of::<usize>()),
                 )
             };
         }
@@ -378,10 +388,13 @@ fn copy_processes(cfg: &mut BootConfig) {
 
 impl BootConfig {
     fn get_top(&self) -> *mut usize {
-        unsafe {
+        let val = unsafe {
             self.sram_start
-                .add((self.sram_size - self.init_size - self.extra_pages * PAGE_SIZE) / 4)
-        }
+                .add((self.sram_size - self.init_size - self.extra_pages * PAGE_SIZE) / mem::size_of::<usize>())
+        };
+        assert!((val as usize) >= (self.sram_start as usize));
+        assert!((val as usize) < (self.sram_start as usize) + self.sram_size);
+        val
     }
 
     /// Zero-alloc a new page, mark it as owned by PID1, and return it.
@@ -391,7 +404,7 @@ impl BootConfig {
         let pg = self.get_top();
         unsafe {
             // Grab the page address and zero it out
-            bzero(pg as *mut usize, pg.add(PAGE_SIZE / 4) as *mut usize);
+            bzero(pg as *mut usize, pg.add(PAGE_SIZE / mem::size_of::<usize>()) as *mut usize);
         }
         // Mark this page as in-use by the kernel
         let extra_bytes = self.extra_pages * PAGE_SIZE;
@@ -434,6 +447,14 @@ impl BootConfig {
     ///
     /// * If you try to map a page twice
     pub fn map_page(&mut self, root: &mut PageTable, phys: usize, virt: usize, flags: usize) {
+        match WORD_SIZE {
+            4 => self.map_page_32(root, phys, virt, flags),
+            8 => panic!("map_page doesn't work on 64-bit devices"),
+            _ => panic!("unrecognized word size: {}", WORD_SIZE),
+        }
+    }
+
+    pub fn map_page_32(&mut self, root: &mut PageTable, phys: usize, virt: usize, flags: usize) {
         let ppn1 = (phys >> 22) & ((1 << 12) - 1);
         let ppn0 = (phys >> 12) & ((1 << 10) - 1);
         let ppo = (phys >> 0) & ((1 << 12) - 1);
@@ -490,20 +511,26 @@ pub fn allocate_regions(cfg: &mut BootConfig) {
     let mut rpt_pages = cfg.sram_size / PAGE_SIZE;
 
     for region in cfg.regions.iter() {
-        // sprintln!(
-        //     "Discovered region {:08x} ({:08x} - {:08x}) -- {} bytes",
-        //     region.name,
-        //     region.start,
-        //     region.start + region.length,
-        //     region.length
-        // );
-        let region_length_rounded = (region.length as usize + 4096 - 1) & !(4096 - 1);
+        println!(
+            "Discovered memory region {:08x} ({:08x} - {:08x}) -- {} bytes",
+            region.name,
+            region.start,
+            region.start + region.length,
+            region.length
+        );
+        let region_length_rounded = (region.length as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         rpt_pages += region_length_rounded / PAGE_SIZE;
     }
+
+    // Round the tracker to a multiple of the page size, so as to keep memory
+    // operations fast.
+    rpt_pages = (rpt_pages + mem::size_of::<usize>() - 1) & !(mem::size_of::<usize>() - 1);
+
     cfg.init_size += rpt_pages * mem::size_of::<XousPid>();
 
     // Clear all memory pages such that they're not owned by anyone
     let runtime_page_tracker = cfg.get_top();
+    assert!((runtime_page_tracker as usize) < (cfg.sram_start as usize) + cfg.sram_size);
     unsafe {
         bzero(
             runtime_page_tracker,
@@ -522,7 +549,7 @@ pub fn allocate_processes(cfg: &mut BootConfig) {
     cfg.init_size += table_size;
     let processes = cfg.get_top();
     unsafe {
-        bzero(processes, processes.add((table_size / 4) as usize));
+        bzero(processes, processes.add((table_size / mem::size_of::<usize>()) as usize));
     }
     cfg.processes = unsafe {
         slice::from_raw_parts_mut(processes as *mut InitialProcess, process_count as usize)
@@ -561,6 +588,8 @@ fn boot_sequence(args: KernelArguments, _signature: u32) -> ! {
         args: args,
         ..Default::default()
     };
+    read_initial_config(&mut cfg);
+
     phase_1(&mut cfg);
     phase_2(&mut cfg);
 
@@ -584,37 +613,40 @@ fn boot_sequence(args: KernelArguments, _signature: u32) -> ! {
 }
 
 fn phase_1(cfg: &mut BootConfig) {
-    read_initial_config(cfg);
 
     // Allocate space for the stack pointer.
     // The bootloader should have placed the stack pointer at the end of RAM
     // prior to jumping to our program, so allocate one page of data for
     // stack.
     // All other allocations will be placed below the stack pointer.
-    cfg.init_size += PAGE_SIZE;
+    cfg.init_size += PAGE_SIZE * 2;
 
     // The first region is defined as being "main RAM", which will be used
     // to keep track of allocations.
+    println!("Allocating regions");
     allocate_regions(cfg);
 
     // The kernel, as well as initial processes, are all stored in RAM.
+    println!("Allocating processes");
     allocate_processes(cfg);
 
     // Copy the arguments, if requested
     if cfg.no_copy {
         // TODO: place args into cfg.args
     } else {
+        println!("Copying args");
         copy_args(cfg);
     }
 
     // All further allocations must be page-aligned.
-    cfg.init_size = (cfg.init_size + 4096 - 1) & !(4096 - 1);
+    cfg.init_size = (cfg.init_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
     // Additionally, from this point on all allocations come from
     // their respective processes rather than kernel memory.
 
     // Copy the processes to RAM, if requested.
     if !cfg.no_copy {
+        println!("Copying processes");
         copy_processes(cfg);
     }
 
@@ -623,6 +655,7 @@ fn phase_1(cfg: &mut BootConfig) {
     // will require us to transfer ownership in `stage3`.
     // Note also that we skip the first index, causing the stack to be
     // returned to the process pool.
+    println!("Marking pages as in-use");
     for i in 1..(cfg.init_size / PAGE_SIZE) {
         cfg.runtime_page_tracker[cfg.sram_size / PAGE_SIZE - i] = 1;
     }
@@ -641,22 +674,25 @@ pub fn phase_2(cfg: &mut BootConfig) {
     let mut pid = 2;
     for tag in args.iter() {
         if tag.name == make_type!("Init") {
+            println!("Loading program into memory");
             let init = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
-            let load_size_rounded = (init.load_size as usize + 4096 - 1) & !(4096 - 1);
+            let load_size_rounded = (init.load_size as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
             init.load(cfg, process_offset - load_size_rounded, pid);
             pid += 1;
             process_offset -= load_size_rounded;
         } else if tag.name == make_type!("XKrn") {
+            println!("Loading kernel into memory");
             let xkrn = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
-            let load_size_rounded = (xkrn.load_size as usize + 4096 - 1) & !(4096 - 1);
+            let load_size_rounded = (xkrn.load_size as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
             xkrn.load(cfg, process_offset - load_size_rounded, 1);
             process_offset -= load_size_rounded;
         }
     }
 
+    println!("Done loading.");
     let krn_struct_start = cfg.sram_start as usize + cfg.sram_size - cfg.init_size;
     let krn_l1_pt_addr = cfg.processes[0].satp << 12;
-    assert!(krn_struct_start & (4096 - 1) == 0);
+    assert!(krn_struct_start & (PAGE_SIZE - 1) == 0);
     let krn_pg0_ptr = unsafe { (krn_l1_pt_addr as *const usize).read() };
 
     // Map boot-generated kernel structures into the kernel
@@ -675,118 +711,21 @@ pub fn phase_2(cfg: &mut BootConfig) {
     // always be made, and that the `stvec` is always valid.
     // Since it's a megapage, all we need to do is write
     // the one address to get all 4MB mapped.
+    println!("Mapping MMU page 0 to all processes");
     for process in cfg.processes[1..].iter() {
         let l1_pt_addr = process.satp << 12;
         unsafe { (l1_pt_addr as *mut usize).write(krn_pg0_ptr) };
     }
 
-    // // XXX FIXME As a test, map the UART to PID1
-    // cfg.map_page(
-    //     unsafe { &mut *((cfg.processes[1].satp << 12) as *mut PageTable) },
-    //     0xF000_1000,
-    //     0xE000_1000,
-    //     FLG_R | FLG_W,
-    // );
-
-    // sprintln!("PID1 pagetables:");
-    // print_pagetable(cfg.processes[0].satp);
-    // sprintln!("");
-    // sprintln!("");
-    // sprintln!("PID2 pagetables:");
-    // print_pagetable(cfg.processes[1].satp);
-    // sprintln!(
-    //     "Runtime Page Tracker: {} bytes",
-    //     cfg.runtime_page_tracker.len()
-    // );
+    println!("PID1 pagetables:");
+    debug::print_pagetable(cfg.processes[0].satp);
+    println!("");
+    println!("");
+    println!("PID2 pagetables:");
+    debug::print_pagetable(cfg.processes[1].satp);
+    println!(
+        "Runtime Page Tracker: {} bytes",
+        cfg.runtime_page_tracker.len()
+    );
     cfg.runtime_page_tracker[cfg.sram_size / PAGE_SIZE - 1] = 0;
 }
-
-// pub struct Uart {
-//     pub base: *mut u32,
-// }
-
-// pub const SUPERVISOR_UART: Uart = Uart {
-//     base: 0xF000_1000 as *mut u32,
-// };
-
-// impl Uart {
-//     pub fn putc(&self, c: u8) {
-//         unsafe {
-//             // Wait until TXFULL is `0`
-//             while self.base.add(1).read_volatile() != 0 {
-//                 ()
-//             }
-//             self.base.add(0).write_volatile(c as u32)
-//         };
-//     }
-// }
-
-// use core::fmt::{Error, Write};
-// impl Write for Uart {
-//     fn write_str(&mut self, s: &str) -> Result<(), Error> {
-//         for c in s.bytes() {
-//             self.putc(c);
-//         }
-//         Ok(())
-//     }
-// }
-
-// #[macro_export]
-// macro_rules! sprint
-// {
-// 	($($args:tt)+) => ({
-// 			use core::fmt::Write;
-// 			let _ = write!(crate::SUPERVISOR_UART, $($args)+);
-// 	});
-// }
-
-// #[macro_export]
-// macro_rules! sprintln
-// {
-// 	() => ({
-// 		sprint!("\r\n")
-// 	});
-// 	($fmt:expr) => ({
-// 		sprint!(concat!($fmt, "\r\n"))
-// 	});
-// 	($fmt:expr, $($args:tt)+) => ({
-// 		sprint!(concat!($fmt, "\r\n"), $($args)+)
-// 	});
-// }
-
-// fn print_pagetable(root: u32) {
-//     sprintln!(
-//         "Memory Maps (SATP: {:08x}  Root: {:08x}):",
-//         root,
-//         root << 12
-//     );
-//     let l1_pt = unsafe { &mut (*((root << 12) as *mut PageTable)) };
-//     for (i, l1_entry) in l1_pt.entries.iter().enumerate() {
-//         if *l1_entry == 0 {
-//             continue;
-//         }
-//         let superpage_addr = i as u32 * (1 << 22);
-//         sprintln!(
-//             "    {:4} Superpage for {:08x} @ {:08x} (flags: {:02x})",
-//             i,
-//             superpage_addr,
-//             (*l1_entry >> 10) << 12,
-//             l1_entry & 0xff
-//         );
-//         // let l0_pt_addr = ((l1_entry >> 10) << 12) as *const u32;
-//         let l0_pt = unsafe { &mut (*(((*l1_entry >> 10) << 12) as *mut PageTable)) };
-//         for (j, l0_entry) in l0_pt.entries.iter().enumerate() {
-//             if *l0_entry == 0 {
-//                 continue;
-//             }
-//             let page_addr = j as u32 * (1 << 12);
-//             sprintln!(
-//                 "        {:4} {:08x} -> {:08x} (flags: {:02x})",
-//                 j,
-//                 superpage_addr + page_addr,
-//                 (*l0_entry >> 10) << 12,
-//                 l0_entry & 0xff
-//             );
-//         }
-//     }
-// }

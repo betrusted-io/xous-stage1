@@ -60,16 +60,16 @@ fn copy_processes() {
     let args = get_args_bin();
     let ka = KernelArguments::new(args.as_ptr() as *const usize);
     let mut cfg = BootConfig {
-        args_base: ka.base as *const usize,
+        args: ka,
         base_addr: ka.base as *const usize,
         ..Default::default()
     };
-    crate::read_initial_config(&mut cfg, &ka);
+    crate::read_initial_config(&mut cfg);
 
     // Patch up the config memory address
     cfg.sram_start = fake_memory.region.as_ptr() as *mut _;
     cfg.sram_size = fake_memory.region.len() / core::mem::size_of::<usize>();
-    crate::copy_processes(&mut cfg, &ka);
+    crate::copy_processes(&mut cfg);
 }
 
 #[test]
@@ -83,11 +83,11 @@ fn allocate_regions() {
     let args = get_args_bin();
     let ka = KernelArguments::new(args.as_ptr() as *const usize);
     let mut cfg = BootConfig {
-        args_base: ka.base as *const usize,
+        args: ka,
         base_addr: ka.base as *const usize,
         ..Default::default()
     };
-    crate::read_initial_config(&mut cfg, &ka);
+    crate::read_initial_config(&mut cfg);
 
     // Patch up the config memory address
     cfg.sram_start = fake_memory.region.as_ptr() as *mut _;
@@ -142,10 +142,10 @@ fn read_initial_config() {
     let args = get_args_bin();
     let ka = KernelArguments::new(args.as_ptr() as *const usize);
     let mut cfg = BootConfig {
-        args_base: ka.base as *const usize,
+        args: ka,
         ..Default::default()
     };
-    crate::read_initial_config(&mut cfg, &ka);
+    crate::read_initial_config(&mut cfg);
 }
 
 // Create a fake "start_kernel" function to allow

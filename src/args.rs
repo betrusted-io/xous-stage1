@@ -8,6 +8,7 @@ macro_rules! make_type {
     }};
 }
 
+#[derive(Clone, Copy)]
 pub struct KernelArguments {
     pub base: *const u32,
 }
@@ -19,7 +20,7 @@ pub struct KernelArgumentsIterator {
 }
 
 impl KernelArguments {
-    pub fn new(base: *const usize) -> Self {
+    pub fn new(base: *const usize) -> KernelArguments {
         KernelArguments {
             base: base as *const u32,
         }

@@ -62,8 +62,8 @@ pub struct BootConfig {
     /// Base load address.  Defaults to the start of the args block
     base_addr: *const usize,
 
-    /// Where the tagged args lsit starts in RAM.
-    args_base: *const usize,
+    /// Where the tagged args list starts in RAM.
+    args: KernelArguments,
 
     /// Additional memory regions in this system
     regions: &'static [MemoryRegionExtra],
@@ -105,7 +105,7 @@ impl Default for BootConfig {
             regions: Default::default(),
             sram_start: 0 as *mut usize,
             sram_size: 0,
-            args_base: 0 as *const usize,
+            args: KernelArguments::new(0 as  *const usize),
             init_size: 0,
             extra_pages: 0,
             runtime_page_tracker: Default::default(),
@@ -300,7 +300,8 @@ where
     }
 }
 
-pub fn read_initial_config(cfg: &mut BootConfig, args: &KernelArguments) {
+pub fn read_initial_config(cfg: &mut BootConfig) {
+    let args = cfg.args;
     let mut i = args.iter();
     let xarg = i.next().expect("couldn't read initial tag");
     if xarg.name != make_type!("XArg") || xarg.size != 20 {
@@ -351,8 +352,8 @@ pub fn read_initial_config(cfg: &mut BootConfig, args: &KernelArguments) {
 
 /// Copy program data from the SPI flash into newly-allocated RAM
 /// located at the end of memory space.
-fn copy_processes(cfg: &mut BootConfig, args: &KernelArguments) {
-    for tag in args.iter() {
+fn copy_processes(cfg: &mut BootConfig) {
+    for tag in cfg.args.iter() {
         if tag.name == make_type!("XKrn") || tag.name == make_type!("Init") {
             let prog = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
 
@@ -528,18 +529,18 @@ pub fn allocate_processes(cfg: &mut BootConfig) {
     };
 }
 
-pub fn copy_args(cfg: &mut BootConfig, args: &KernelArguments) {
+pub fn copy_args(cfg: &mut BootConfig) {
     // Copy the args list to target RAM
-    cfg.init_size += args.size();
+    cfg.init_size += cfg.args.size();
     let runtime_arg_buffer = cfg.get_top();
     unsafe {
         memcpy(
             runtime_arg_buffer,
-            args.base as *const usize,
-            args.size() as usize,
+            cfg.args.base as *const usize,
+            cfg.args.size() as usize,
         )
     };
-    cfg.args_base = runtime_arg_buffer;
+    cfg.args = KernelArguments::new(runtime_arg_buffer);
 }
 
 /// Stage 1 Bootloader
@@ -548,18 +549,42 @@ pub fn copy_args(cfg: &mut BootConfig, args: &KernelArguments) {
 /// Assume the bootloader has already set up the stack to point to the end of RAM.
 #[export_name = "rust_entry"]
 pub unsafe extern "C" fn rust_entry(arg_buffer: *const usize, signature: u32) -> ! {
-    stage1(KernelArguments::new(arg_buffer), signature);
+    let kab = KernelArguments::new(arg_buffer);
+    boot_sequence(kab, signature);
 }
 
-fn stage1(args: KernelArguments, _signature: u32) -> ! {
+fn boot_sequence(args: KernelArguments, _signature: u32) -> ! {
     // Store the initial boot config on the stack.  We don't know
     // where in heap this memory will go.
     let mut cfg = BootConfig {
         base_addr: args.base as *const usize,
-        args_base: args.base as *const usize,
+        args: args,
         ..Default::default()
     };
-    read_initial_config(&mut cfg, &args);
+    phase_1(&mut cfg);
+    phase_2(&mut cfg);
+
+    // The MMU should be set up now, and memory pages assigned to their
+    // respective processes.
+    let krn_struct_start = cfg.sram_start as usize + cfg.sram_size - cfg.init_size;
+    let arg_offset = cfg.args.base as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
+    let ip_offset = cfg.processes.as_ptr() as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
+    let rpt_offset =
+        cfg.runtime_page_tracker.as_ptr() as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
+    unsafe {
+        start_kernel(
+            arg_offset,
+            ip_offset,
+            rpt_offset,
+            cfg.processes[0].satp,
+            cfg.processes[0].entrypoint,
+            cfg.processes[0].sp,
+        );
+    }
+}
+
+fn phase_1(cfg: &mut BootConfig) {
+    read_initial_config(cfg);
 
     // Allocate space for the stack pointer.
     // The bootloader should have placed the stack pointer at the end of RAM
@@ -570,16 +595,16 @@ fn stage1(args: KernelArguments, _signature: u32) -> ! {
 
     // The first region is defined as being "main RAM", which will be used
     // to keep track of allocations.
-    allocate_regions(&mut cfg);
+    allocate_regions(cfg);
 
     // The kernel, as well as initial processes, are all stored in RAM.
-    allocate_processes(&mut cfg);
+    allocate_processes(cfg);
 
     // Copy the arguments, if requested
     if cfg.no_copy {
         // TODO: place args into cfg.args
     } else {
-        copy_args(&mut cfg, &args);
+        copy_args(cfg);
     }
 
     // All further allocations must be page-aligned.
@@ -590,7 +615,7 @@ fn stage1(args: KernelArguments, _signature: u32) -> ! {
 
     // Copy the processes to RAM, if requested.
     if !cfg.no_copy {
-        copy_processes(&mut cfg, &args);
+        copy_processes(cfg);
     }
 
     // Mark all pages as in-use by the kernel.
@@ -601,14 +626,12 @@ fn stage1(args: KernelArguments, _signature: u32) -> ! {
     for i in 1..(cfg.init_size / PAGE_SIZE) {
         cfg.runtime_page_tracker[cfg.sram_size / PAGE_SIZE - i] = 1;
     }
-
-    stage2(&mut cfg);
 }
 
 /// Stage 2 bootloader
 /// This sets up the MMU and loads both PID1 and the kernel into RAM.
-fn stage2(cfg: &mut BootConfig) -> ! {
-    let args = KernelArguments::new(cfg.args_base);
+pub fn phase_2(cfg: &mut BootConfig) {
+    let args = cfg.args;
 
     // This is the offset in RAM where programs are loaded from.
     let mut process_offset = cfg.sram_start as usize + cfg.sram_size - cfg.init_size;
@@ -676,21 +699,6 @@ fn stage2(cfg: &mut BootConfig) -> ! {
     //     cfg.runtime_page_tracker.len()
     // );
     cfg.runtime_page_tracker[cfg.sram_size / PAGE_SIZE - 1] = 0;
-
-    let arg_offset = cfg.args_base as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
-    let ip_offset = cfg.processes.as_ptr() as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
-    let rpt_offset =
-        cfg.runtime_page_tracker.as_ptr() as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
-    unsafe {
-        start_kernel(
-            arg_offset,
-            ip_offset,
-            rpt_offset,
-            cfg.processes[0].satp,
-            cfg.processes[0].entrypoint,
-            cfg.processes[0].sp,
-        );
-    }
 }
 
 // pub struct Uart {

@@ -65,6 +65,10 @@ pub struct BootConfig {
     /// Base load address.  Defaults to the start of the args block
     base_addr: *const usize,
 
+    /// `true` if we should enable the `SUM` bit, allowing the
+    /// kernel to access user memory.
+    debug: bool,
+
     /// Where the tagged args list starts in RAM.
     args: KernelArguments,
 
@@ -104,6 +108,7 @@ impl Default for BootConfig {
     fn default() -> BootConfig {
         BootConfig {
             no_copy: false,
+            debug: false,
             base_addr: 0 as *const usize,
             regions: Default::default(),
             sram_start: 0 as *mut usize,
@@ -172,6 +177,7 @@ extern "C" {
         satp: usize,
         entrypoint: usize,
         stack: usize,
+        debug: bool,
     ) -> !;
 }
 
@@ -332,11 +338,14 @@ pub fn read_initial_config(cfg: &mut BootConfig) {
             };
         } else if tag.name == make_type!("Bflg") {
             let boot_flags = tag.data[0];
-            if boot_flags & 1 != 0 {
+            if boot_flags & (1<<0) != 0 {
                 cfg.no_copy = true;
             }
-            if boot_flags & 2 != 0 {
+            if boot_flags & (1<<1) != 0 {
                 cfg.base_addr = 0 as *const usize;
+            }
+            if boot_flags & (1<<2) != 0 {
+                cfg.debug = true;
             }
         } else if tag.name == make_type!("XKrn") {
             assert!(!kernel_seen, "kernel appears twice");
@@ -608,6 +617,7 @@ fn boot_sequence(args: KernelArguments, _signature: u32) -> ! {
             cfg.processes[0].satp,
             cfg.processes[0].entrypoint,
             cfg.processes[0].sp,
+            cfg.debug,
         );
     }
 }

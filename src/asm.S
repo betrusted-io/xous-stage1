@@ -25,10 +25,6 @@ abort:
 
 .global start_kernel
 start_kernel:
-    // Enable external interrupts for both machine and supervisor mode
-    # li          t0, 0xa0a
-    # csrw        mie, t0
-
     // Delegate as much as we can supervisor mode
     li          t0, 0xffffffff
     csrw        mideleg, t0
@@ -36,6 +32,11 @@ start_kernel:
 
     // Return to Supervisor mode (and enable interrupts)
     li		    t0, (1 << 11) | (1 << 5)
+    // If arg6 is "true", also set mstatus.SUM to allow the kernel
+    // to access userspace memory.
+    andi        a6, a6, 1
+    slli        a6, a6, 18
+    or          t0, t0, a6
     csrw	    mstatus, t0
 
     // Enable the MMU (once we issue `mret`) and flush the cache
@@ -46,7 +47,7 @@ start_kernel:
     csrw        mepc, a4
 
     // Reposition the stack at the offset passed by $a5
-    add         sp, a5, zero
+    move        sp, a5
 
     // Issue the return, which will jump to $mepc in Supervisor mode
     mret

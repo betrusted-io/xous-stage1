@@ -191,6 +191,36 @@ fn read_word(satp: usize, virt: usize) -> Result<u32, &'static str> {
     Ok(unsafe { (page_base as *mut u32).read() })
 }
 
+fn verify_program(cfg: &BootConfig, pid: usize, arg: &crate::args::KernelArgument) {
+    let prog = unsafe { &*(arg.data.as_ptr() as *const crate::ProgramDescription) };
+    let program_offset = prog.load_offset as usize;
+    let mut src_kernel = vec![];
+    {
+        for i in 0..(prog.load_size as usize) {
+            let word = unsafe {
+                (cfg.base_addr as *mut u32)
+                    .add((program_offset + i) / 4)
+                    .read()
+            };
+            src_kernel.push(word);
+        }
+    }
+    println!(
+        "Inspecting {} bytes of PID {}, starting from {:08x}",
+        src_kernel.len() * 4,
+        pid,
+        prog.load_offset
+    );
+    for addr in (0..(prog.load_size as usize)).step_by(4) {
+        assert_eq!(
+            src_kernel[addr],
+            read_word(cfg.processes[pid].satp as usize, addr + prog.text_offset as usize).unwrap(),
+            "kernel doesn't match @ offset {:08x}",
+            addr + prog.text_offset as usize
+        );
+    }
+}
+
 #[test]
 fn full_boot() {
     let mut env = TestEnvironment::new();
@@ -202,38 +232,15 @@ fn full_boot() {
     println!("Done with phases");
 
     let mut xkrn_inspected = false;
+    let mut init_index = 0;
     for arg in env.cfg.args.iter() {
         if arg.name == make_type!("XKrn") {
-            let prog = unsafe { &*(arg.data.as_ptr() as *const crate::ProgramDescription) };
-            let program_offset = prog.load_offset as usize;
-            let mut src_kernel = vec![];
-            {
-                let src_ptr = arg.data;
-                for i in (0..(prog.load_size as usize)) {
-                    let word = unsafe {
-                        (env.cfg.base_addr as *mut u32)
-                            .add((program_offset + i) / 4)
-                            .read()
-                    };
-                    src_kernel.push(word);
-                }
-            }
-            println!(
-                "SATP @ {:08x}  Entrypoint @ {:08x}  Kernel: {} bytes starting from {:08x}",
-                env.cfg.processes[0].satp as usize,
-                env.cfg.processes[0].entrypoint as usize,
-                src_kernel.len() * 4,
-                prog.load_offset
-            );
-            for addr in (0..(prog.load_size as usize)).step_by(4) {
-                assert_eq!(
-                    src_kernel[addr],
-                    read_word(env.cfg.processes[0].satp as usize, addr + 0x00200000).unwrap(),
-                    "kernel doesn't match @ offset {:08x}",
-                    addr + 0x00200000
-                );
-            }
+            verify_program(&env.cfg, 0, &arg);
+            assert!(xkrn_inspected == false, "multiple kernels found");
             xkrn_inspected = true;
+        } else if arg.name == make_type!("Init") {
+            init_index += 1;
+            verify_program(&env.cfg, init_index, &arg);
         }
     }
     assert_eq!(xkrn_inspected, true, "didn't see kernel in output list");

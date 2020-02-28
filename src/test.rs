@@ -162,6 +162,35 @@ fn read_initial_config() {
     crate::read_initial_config(&mut cfg);
 }
 
+fn read_word(satp: usize, virt: usize) -> Result<u32, &'static str> {
+    if satp & 0x80000000 != 0x80000000 {
+        return Err("satp valid bit isn't set");
+    }
+    // let ppn1 = (phys >> 22) & ((1 << 12) - 1);
+    // let ppn0 = (phys >> 12) & ((1 << 10) - 1);
+    // let ppo = (phys >> 0) & ((1 << 12) - 1);
+
+    let vpn1 = (virt >> 22) & ((1 << 10) - 1);
+    let vpn0 = (virt >> 12) & ((1 << 10) - 1);
+    let vpo = (virt >> 0) & ((1 << 12) - 1);
+
+    let l1_pt = unsafe { &mut (*((satp << 12) as *mut crate::PageTable)) };
+    let l1_entry = l1_pt.entries[vpn1];
+    // FIXME: This could also be a megapage
+    if l1_entry & 7 != 1 {
+        return Err("l1 page table not mapped");
+    }
+    let l0_pt = unsafe { &mut (*(((l1_entry >> 10) << 12) as *mut crate::PageTable)) };
+    let l0_entry = l0_pt.entries[vpn0];
+    if l0_entry & 1 != 1 {
+        return Err("l0 page table not mapped");
+    }
+    // println!("l0_entry: {:08x}", l0_entry);
+    let page_base = (((l0_entry as u32) >> 10) << 12) + vpo as u32;
+    // println!("virt {:08x} -> phys {:08x}", virt, page_base);
+    Ok(unsafe { (page_base as *mut u32).read() })
+}
+
 #[test]
 fn full_boot() {
     let mut env = TestEnvironment::new();
@@ -171,6 +200,43 @@ fn full_boot() {
     println!("Running phase_2");
     crate::phase_2(&mut env.cfg);
     println!("Done with phases");
+
+    let mut xkrn_inspected = false;
+    for arg in env.cfg.args.iter() {
+        if arg.name == make_type!("XKrn") {
+            let prog = unsafe { &*(arg.data.as_ptr() as *const crate::ProgramDescription) };
+            let program_offset = prog.load_offset as usize;
+            let mut src_kernel = vec![];
+            {
+                let src_ptr = arg.data;
+                for i in (0..(prog.load_size as usize)) {
+                    let word = unsafe {
+                        (env.cfg.base_addr as *mut u32)
+                            .add((program_offset + i) / 4)
+                            .read()
+                    };
+                    src_kernel.push(word);
+                }
+            }
+            println!(
+                "SATP @ {:08x}  Entrypoint @ {:08x}  Kernel: {} bytes starting from {:08x}",
+                env.cfg.processes[0].satp as usize,
+                env.cfg.processes[0].entrypoint as usize,
+                src_kernel.len() * 4,
+                prog.load_offset
+            );
+            for addr in (0..(prog.load_size as usize)).step_by(4) {
+                assert_eq!(
+                    src_kernel[addr],
+                    read_word(env.cfg.processes[0].satp as usize, addr + 0x00200000).unwrap(),
+                    "kernel doesn't match @ offset {:08x}",
+                    addr + 0x00200000
+                );
+            }
+            xkrn_inspected = true;
+        }
+    }
+    assert_eq!(xkrn_inspected, true, "didn't see kernel in output list");
 }
 
 #[test]
@@ -183,16 +249,26 @@ fn tracker_sane() {
     let mut max_pid = 0;
     for process in env.cfg.processes.iter() {
         let satp = process.satp;
-        let pid = (satp >> 22 & ((1<<9) - 1)) as u8;
+        let pid = (satp >> 22 & ((1 << 9) - 1)) as u8;
         if pid > max_pid {
             max_pid = pid;
         }
         let mem_base = satp << 12;
-        println!("Process {} @ {:08x} ({:08x}), entrypoint {:08x}, sp {:08x}", pid, mem_base, satp, process.entrypoint, process.sp);
+        println!(
+            "Process {} @ {:08x} ({:08x}), entrypoint {:08x}, sp {:08x}",
+            pid, mem_base, satp, process.entrypoint, process.sp
+        );
     }
 
     for (idx, addr) in env.cfg.runtime_page_tracker.iter().enumerate() {
-        assert!(*addr <= max_pid, "runtime page tracker contains invalid values @ {} ({:08x})! {} > {}", idx, addr as *const u8 as usize, *addr, max_pid);
+        assert!(
+            *addr <= max_pid,
+            "runtime page tracker contains invalid values @ {} ({:08x})! {} > {}",
+            idx,
+            addr as *const u8 as usize,
+            *addr,
+            max_pid
+        );
     }
 }
 

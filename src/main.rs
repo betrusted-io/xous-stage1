@@ -145,7 +145,7 @@ pub struct InitialProcess {
 
 /// This describes the kernel as well as initially-loaded processes
 #[repr(C)]
-struct ProgramDescription {
+pub struct ProgramDescription {
     /// Physical source address of this program in RAM (i.e. SPI flash)
     load_offset: u32,
 
@@ -609,6 +609,11 @@ fn boot_sequence(args: KernelArguments, _signature: u32) -> ! {
     let ip_offset = cfg.processes.as_ptr() as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     let rpt_offset =
         cfg.runtime_page_tracker.as_ptr() as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
+    println!("Jumping to kernel @ {:08x} with map @ {:08x} and stack @ {:08x}",
+        cfg.processes[0].satp,
+        cfg.processes[0].entrypoint,
+        cfg.processes[0].sp,
+    );
     unsafe {
         start_kernel(
             arg_offset,

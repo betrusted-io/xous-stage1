@@ -285,15 +285,15 @@ impl ProgramDescription {
         }
 
         // Our "earlyprintk" equivalent
-        // if is_kernel {
-        //     allocator.map_page(
-        //         satp,
-        //         0xF0002000,
-        //         0x001f_0000,
-        //         FLG_R | FLG_W,
-        //     );
-        //     allocator.change_owner(pid as XousPid, 0xF0002000);
-        // }
+        if cfg!(feature = "earlyprintk") && is_kernel {
+            allocator.map_page(
+                satp,
+                0xF0002000,
+                0x001f_0000,
+                FLG_R | FLG_W,
+            );
+            allocator.change_owner(pid as XousPid, 0xF0002000);
+        }
 
         let ref mut process = allocator.processes[pid_idx];
         process.entrypoint = self.entrypoint as usize;

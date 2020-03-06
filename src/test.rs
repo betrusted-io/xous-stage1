@@ -194,29 +194,59 @@ fn read_word(satp: usize, virt: usize) -> Result<u32, &'static str> {
 fn verify_program(cfg: &BootConfig, pid: usize, arg: &crate::args::KernelArgument) {
     let prog = unsafe { &*(arg.data.as_ptr() as *const crate::ProgramDescription) };
     let program_offset = prog.load_offset as usize;
-    let mut src_kernel = vec![];
+    let mut src_text = vec![];
+    let mut src_data = vec![];
     {
-        for i in 0..(prog.load_size as usize) {
+        for i in 0..(prog.text_size as usize) {
             let word = unsafe {
                 (cfg.base_addr as *mut u32)
                     .add((program_offset + i) / 4)
                     .read()
             };
-            src_kernel.push(word);
+            src_text.push(word);
+        }
+
+        for i in 0..(prog.data_size as usize) {
+            let word = unsafe {
+                (cfg.base_addr as *mut u32)
+                    .add((program_offset + prog.text_size as usize + i) / 4)
+                    .read()
+            };
+            src_data.push(word);
         }
     }
     println!(
-        "Inspecting {} bytes of PID {}, starting from {:08x}",
-        src_kernel.len() * 4,
+        "Inspecting {} bytes of PID ({} bytes of text, {} bytes of data) {}, starting from {:08x}",
+        src_text.len() * 4 + src_data.len() * 4,
+        src_text.len() * 4, src_data.len() * 4,
         pid,
         prog.load_offset
     );
-    for addr in (0..(prog.load_size as usize)).step_by(4) {
+    for addr in (0..(prog.text_size as usize)).step_by(4) {
         assert_eq!(
-            src_kernel[addr],
+            src_text[addr],
             read_word(cfg.processes[pid].satp as usize, addr + prog.text_offset as usize).unwrap(),
-            "kernel doesn't match @ offset {:08x}",
+            "program text doesn't match @ offset {:08x}",
             addr + prog.text_offset as usize
+        );
+    }
+
+    for addr in (0..(prog.data_size as usize)).step_by(4) {
+        assert_eq!(
+            src_data[addr],
+            read_word(cfg.processes[pid].satp as usize, addr + prog.data_offset as usize).unwrap(),
+            "program data doesn't match @ offset {:08x}",
+            addr + prog.data_offset as usize
+        );
+    }
+
+    for addr in ((prog.data_size as usize)..((prog.data_size + prog.bss_size) as usize)).step_by(4) {
+        println!("Verifying BSS @ {:08x} is 0", addr + prog.data_offset as usize);
+        assert_eq!(
+            0,
+            read_word(cfg.processes[pid].satp as usize, addr + prog.data_offset as usize).unwrap(),
+            "bss is not zero @ offset {:08x}",
+            addr + prog.data_offset as usize
         );
     }
 }

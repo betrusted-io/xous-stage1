@@ -10,4 +10,5 @@ rustflags = [
 rustflags = [
   "-C", "link-arg=-Tlink.x",
   "-C", "inline-threshold=275",
+  "-C", "force-frame-pointers=no",
 ]

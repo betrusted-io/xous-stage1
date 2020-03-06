@@ -113,7 +113,7 @@ impl Default for BootConfig {
             regions: Default::default(),
             sram_start: 0 as *mut usize,
             sram_size: 0,
-            args: KernelArguments::new(0 as  *const usize),
+            args: KernelArguments::new(0 as *const usize),
             init_size: 0,
             extra_pages: 0,
             runtime_page_tracker: Default::default(),
@@ -146,24 +146,29 @@ pub struct InitialProcess {
 /// This describes the kernel as well as initially-loaded processes
 #[repr(C)]
 pub struct ProgramDescription {
-    /// Physical source address of this program in RAM (i.e. SPI flash)
+    /// Physical source address of this program in RAM (i.e. SPI flash).
+    /// The image is assumed to contain a text section followed immediately
+    /// by a data section.
     load_offset: u32,
-
-    /// How many bytes of data to load from the source to the target
-    load_size: u32,
 
     /// Start of the virtual address where the .text section will go.
     /// This section will be marked non-writable, executable.
     text_offset: u32,
+
+    /// How many bytes of data to load from the source to the target
+    text_size: u32,
 
     /// Start of the virtual address of .data and .bss section in RAM.
     /// This will simply allocate this memory and mark it "read-write"
     /// without actually copying any data.
     data_offset: u32,
 
-    /// Size of .data and .bss section.  This many bytes will be allocated
-    /// for the data section.
+    /// Size of the .data section, in bytes..  This many bytes will
+    /// be allocated for the data section.
     data_size: u32,
+
+    /// Size of the .bss section, in bytes.
+    bss_size: u32,
 
     /// Virtual address entry point.
     entrypoint: u32,
@@ -189,15 +194,18 @@ impl ProgramDescription {
     /// for this reason.
     pub fn load(&self, allocator: &mut BootConfig, load_offset: usize, pid: XousPid) {
         assert!(pid != 0);
-        println!("Loading program {} into offset {:08x}", pid, load_offset);
+        println!("Mapping PID {} into offset {:08x}", pid, load_offset);
         let pid_idx = (pid - 1) as usize;
         let is_kernel = pid == 1;
         let flag_defaults = FLG_R | FLG_W | if is_kernel { 0 } else { FLG_U };
         let stack_addr = USER_STACK_OFFSET;
         if is_kernel {
             assert!(self.text_offset as usize == KERNEL_LOAD_OFFSET);
-            assert!(((self.text_offset + self.load_size) as usize) < EXCEPTION_STACK_OFFSET);
-            assert!(((self.data_offset + self.data_size) as usize) < EXCEPTION_STACK_OFFSET);
+            assert!(((self.text_offset + self.text_size) as usize) < EXCEPTION_STACK_OFFSET);
+            assert!(
+                ((self.data_offset + self.data_size + self.bss_size) as usize)
+                    < EXCEPTION_STACK_OFFSET
+            );
             assert!(self.data_offset as usize >= KERNEL_LOAD_OFFSET);
         } else {
             assert!(self.text_offset as usize >= USER_AREA_START);
@@ -210,13 +218,10 @@ impl ProgramDescription {
         }
 
         // Allocate a page to handle the top-level memory translation
-        println!("Allocating");
         let satp_address = allocator.alloc() as usize;
-        println!("Changing owner");
         allocator.change_owner(pid as XousPid, satp_address);
 
         // Turn the satp address into a pointer
-        println!("Mapping thingy");
         let satp = unsafe { &mut *(satp_address as *mut PageTable) };
         allocator.map_page(satp, satp_address, PAGE_TABLE_ROOT_OFFSET, FLG_R | FLG_W);
 
@@ -262,10 +267,19 @@ impl ProgramDescription {
         // Either this is on SPI flash at an aligned address, or it
         // has been copied into RAM already.  This is why we ignore `self.load_offset`
         // and use the `load_offset` parameter instead.
-        for offset in (0..self.load_size as usize).step_by(PAGE_SIZE) {
+        let rounded_data_bss =
+            ((self.data_size + self.bss_size) as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+        // let load_size_rounded = (self.text_size as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        for offset in (0..self.text_size as usize).step_by(PAGE_SIZE) {
+            println!(
+                "   TEXT: Mapping {:08x} -> {:08x}",
+                load_offset + offset + rounded_data_bss,
+                self.text_offset as usize + offset
+            );
             allocator.map_page(
                 satp,
-                load_offset + offset,
+                load_offset + offset + rounded_data_bss,
                 self.text_offset as usize + offset,
                 flag_defaults | FLG_X,
             );
@@ -273,25 +287,27 @@ impl ProgramDescription {
         }
 
         // Map the process data section into RAM.
-        for offset in (0..self.data_size as usize).step_by(PAGE_SIZE as usize) {
-            let page_addr = allocator.alloc();
+        for offset in (0..(self.data_size + self.bss_size) as usize).step_by(PAGE_SIZE as usize) {
+            // let page_addr = allocator.alloc();
+            println!(
+                "   DATA: Mapping {:08x} -> {:08x}",
+                load_offset + offset,
+                self.data_offset as usize + offset
+            );
             allocator.map_page(
                 satp,
-                page_addr as usize,
+                load_offset + offset,
                 self.data_offset as usize + offset,
                 flag_defaults,
             );
             allocator.change_owner(pid as XousPid, load_offset as usize + offset);
         }
 
+        // Allocate pages for .bss, if necessary
+
         // Our "earlyprintk" equivalent
         if cfg!(feature = "earlyprintk") && is_kernel {
-            allocator.map_page(
-                satp,
-                0xF0002000,
-                0x001f_0000,
-                FLG_R | FLG_W,
-            );
+            allocator.map_page(satp, 0xF0002000, 0x001f_0000, FLG_R | FLG_W);
             allocator.change_owner(pid as XousPid, 0xF0002000);
         }
 
@@ -349,13 +365,13 @@ pub fn read_initial_config(cfg: &mut BootConfig) {
             };
         } else if tag.name == make_type!("Bflg") {
             let boot_flags = tag.data[0];
-            if boot_flags & (1<<0) != 0 {
+            if boot_flags & (1 << 0) != 0 {
                 cfg.no_copy = true;
             }
-            if boot_flags & (1<<1) != 0 {
+            if boot_flags & (1 << 1) != 0 {
                 cfg.base_addr = 0 as *const usize;
             }
-            if boot_flags & (1<<2) != 0 {
+            if boot_flags & (1 << 2) != 0 {
                 cfg.debug = true;
             }
         } else if tag.name == make_type!("XKrn") {
@@ -386,19 +402,68 @@ fn copy_processes(cfg: &mut BootConfig) {
         if tag.name == make_type!("XKrn") || tag.name == make_type!("Init") {
             let prog = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
 
+            // TEXT SECTION
             // Round it off to a page boundary
-            let load_size_rounded = (prog.load_size as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            let load_size_rounded = (prog.text_size as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
             cfg.extra_pages += load_size_rounded / PAGE_SIZE;
             let top = cfg.get_top();
             unsafe {
                 // Copy the program to the target address, rounding it off to the load size.
-                let src_addr = cfg.base_addr.add(prog.load_offset as usize / mem::size_of::<usize>());
-                println!("Loading from {:08x} to {:08x} ({} bytes long)", src_addr as usize, top as usize, prog.load_size);
-                memcpy(top, src_addr, prog.load_size as usize);
+                let src_addr = cfg
+                    .base_addr
+                    .add(prog.load_offset as usize / mem::size_of::<usize>());
+                println!(
+                    "    Copying TEXT from {:08x}-{:08x} to {:08x}-{:08x} ({} bytes long)",
+                    src_addr as usize,
+                    src_addr as u32 + prog.text_size,
+                    top as usize,
+                    top as u32 + prog.text_size + 4,
+                    prog.text_size + 4
+                );
+                println!(
+                    "    Zeroing out TEXT from {:08x}-{:08x}",
+                    top.add(prog.text_size as usize / mem::size_of::<usize>()) as usize,
+                    top.add(load_size_rounded as usize / mem::size_of::<usize>()) as usize,
+                );
+
+                memcpy(top, src_addr, prog.text_size as usize + 1);
 
                 // Zero out the remaining data.
                 bzero(
-                    top.add(prog.load_size as usize / mem::size_of::<usize>()),
+                    top.add(prog.text_size as usize / mem::size_of::<usize>()),
+                    top.add(load_size_rounded as usize / mem::size_of::<usize>()),
+                )
+            };
+
+            // DATA SECTION
+            // Round it off to a page boundary
+            let load_size_rounded =
+                ((prog.data_size + prog.bss_size) as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            cfg.extra_pages += load_size_rounded / PAGE_SIZE;
+            let top = cfg.get_top();
+            unsafe {
+                // Copy the program to the target address, rounding it off to the load size.
+                let src_addr = cfg.base_addr.add(
+                    (prog.load_offset + prog.text_size + 4) as usize / mem::size_of::<usize>() - 1,
+                );
+                println!(
+                    "    Copying DATA from {:08x}-{:08x} to {:08x}-{:08x} ({} bytes long)",
+                    src_addr as usize,
+                    src_addr as u32 + prog.data_size,
+                    top as usize,
+                    top as u32 + prog.data_size,
+                    prog.data_size
+                );
+                memcpy(top, src_addr, prog.data_size as usize + 1);
+
+                // Zero out the remaining data.
+                println!(
+                    "    Zeroing out DATA from {:08x} - {:08x}",
+                    top.add(prog.data_size as usize / mem::size_of::<usize>()) as usize,
+                    top.add(load_size_rounded as usize / mem::size_of::<usize>()) as usize
+                );
+                bzero(
+                    top.add(prog.data_size as usize / mem::size_of::<usize>()),
                     top.add(load_size_rounded as usize / mem::size_of::<usize>()),
                 )
             };
@@ -409,8 +474,10 @@ fn copy_processes(cfg: &mut BootConfig) {
 impl BootConfig {
     fn get_top(&self) -> *mut usize {
         let val = unsafe {
-            self.sram_start
-                .add((self.sram_size - self.init_size - self.extra_pages * PAGE_SIZE) / mem::size_of::<usize>())
+            self.sram_start.add(
+                (self.sram_size - self.init_size - self.extra_pages * PAGE_SIZE)
+                    / mem::size_of::<usize>(),
+            )
         };
         assert!((val as usize) >= (self.sram_start as usize));
         assert!((val as usize) < (self.sram_start as usize) + self.sram_size);
@@ -424,7 +491,10 @@ impl BootConfig {
         let pg = self.get_top();
         unsafe {
             // Grab the page address and zero it out
-            bzero(pg as *mut usize, pg.add(PAGE_SIZE / mem::size_of::<usize>()) as *mut usize);
+            bzero(
+                pg as *mut usize,
+                pg.add(PAGE_SIZE / mem::size_of::<usize>()) as *mut usize,
+            );
         }
         // Mark this page as in-use by the kernel
         let extra_bytes = self.extra_pages * PAGE_SIZE;
@@ -569,7 +639,10 @@ pub fn allocate_processes(cfg: &mut BootConfig) {
     cfg.init_size += table_size;
     let processes = cfg.get_top();
     unsafe {
-        bzero(processes, processes.add((table_size / mem::size_of::<usize>()) as usize));
+        bzero(
+            processes,
+            processes.add((table_size / mem::size_of::<usize>()) as usize),
+        );
     }
     cfg.processes = unsafe {
         slice::from_raw_parts_mut(processes as *mut InitialProcess, process_count as usize)
@@ -620,10 +693,10 @@ fn boot_sequence(args: KernelArguments, _signature: u32) -> ! {
     let ip_offset = cfg.processes.as_ptr() as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
     let rpt_offset =
         cfg.runtime_page_tracker.as_ptr() as usize - krn_struct_start + KERNEL_ARGUMENT_OFFSET;
-    println!("Jumping to kernel @ {:08x} with map @ {:08x} and stack @ {:08x}",
-        cfg.processes[0].satp,
-        cfg.processes[0].entrypoint,
-        cfg.processes[0].sp,
+    println!(
+        "Jumping to kernel @ {:08x} with map @ {:08x} and stack @ {:08x} (kargs: {:08x}, ip: {:08x}, rpt: {:08x})",
+        cfg.processes[0].entrypoint, cfg.processes[0].satp, cfg.processes[0].sp,
+        arg_offset, ip_offset, rpt_offset,
     );
     unsafe {
         start_kernel(
@@ -639,7 +712,6 @@ fn boot_sequence(args: KernelArguments, _signature: u32) -> ! {
 }
 
 fn phase_1(cfg: &mut BootConfig) {
-
     // Allocate space for the stack pointer.
     // The bootloader should have placed the stack pointer at the end of RAM
     // prior to jumping to our program, so allocate one page of data for
@@ -700,16 +772,18 @@ pub fn phase_2(cfg: &mut BootConfig) {
     let mut pid = 2;
     for tag in args.iter() {
         if tag.name == make_type!("Init") {
-            println!("Loading program into memory");
+            println!("Mapping program into memory");
             let init = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
-            let load_size_rounded = (init.load_size as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            let load_size_rounded = ((init.text_size as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1))
+                + (((init.data_size + init.bss_size) as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
             init.load(cfg, process_offset - load_size_rounded, pid);
             pid += 1;
             process_offset -= load_size_rounded;
         } else if tag.name == make_type!("XKrn") {
-            println!("Loading kernel into memory");
+            println!("Mapping kernel into memory");
             let xkrn = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
-            let load_size_rounded = (xkrn.load_size as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            let load_size_rounded = ((xkrn.text_size as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1))
+                + (((xkrn.data_size + xkrn.bss_size) as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
             xkrn.load(cfg, process_offset - load_size_rounded, 1);
             process_offset -= load_size_rounded;
         }
@@ -747,8 +821,8 @@ pub fn phase_2(cfg: &mut BootConfig) {
     debug::print_pagetable(cfg.processes[0].satp);
     println!("");
     println!("");
-    println!("PID2 pagetables:");
-    debug::print_pagetable(cfg.processes[1].satp);
+    // println!("PID2 pagetables:");
+    // debug::print_pagetable(cfg.processes[1].satp);
     println!(
         "Runtime Page Tracker: {} bytes",
         cfg.runtime_page_tracker.len()

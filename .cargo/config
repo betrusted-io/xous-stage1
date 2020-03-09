@@ -1,12 +1,10 @@
 [target.riscv32i-unknown-none-elf]
-#runner = "riscv64-unknown-elf-gdb -x gdb_init"
 rustflags = [
   "-C", "link-arg=-Tlink.x",
   "-C", "inline-threshold=275",
 ]
 
 [target.riscv32imac-unknown-none-elf]
-#runner = "riscv64-unknown-elf-gdb -x gdb_init"
 rustflags = [
   "-C", "link-arg=-Tlink.x",
   "-C", "inline-threshold=275",

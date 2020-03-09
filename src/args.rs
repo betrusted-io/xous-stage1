@@ -42,7 +42,11 @@ impl KernelArguments {
 
 pub struct KernelArgument {
     pub name: u32,
+
+    // Total number of bytes in the data section
     pub size: u32,
+
+    // Data section, as a slice of 32-bit ints
     pub data: &'static [u32],
 }
 

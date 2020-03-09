@@ -3,7 +3,7 @@
 
 #[macro_use]
 mod args;
-use args::KernelArguments;
+use args::{KernelArguments, KernelArgument};
 
 use core::{mem, ptr, slice};
 
@@ -11,17 +11,17 @@ pub type XousPid = u8;
 pub const PAGE_SIZE: usize = 4096;
 const WORD_SIZE: usize = mem::size_of::<usize>();
 
-const USER_STACK_OFFSET: usize = 0xdfff_fffc;
-const PAGE_TABLE_OFFSET: usize = 0x0040_0000;
-const PAGE_TABLE_ROOT_OFFSET: usize = 0x0080_0000;
-const CONTEXT_OFFSET: usize = 0x0080_1000;
-const USER_AREA_START: usize = 0x00c0_0000;
+const USER_STACK_TOP: usize = 0x8000_0000;
+const PAGE_TABLE_OFFSET: usize = 0xff40_0000;
+const PAGE_TABLE_ROOT_OFFSET: usize = 0xff80_0000;
+const CONTEXT_OFFSET: usize = 0xff80_1000;
+const USER_AREA_END: usize = 0xff00_0000;
 
-// All of the kernel structures must live within Megapage 0,
+// All of the kernel structures must live within Megapage 1023,
 // and therefore are limited to 4 MB.
-const EXCEPTION_STACK_OFFSET: usize = 0x003f_fffc;
-const KERNEL_LOAD_OFFSET: usize = 0x0020_0000;
-const KERNEL_ARGUMENT_OFFSET: usize = 0x0010_0000;
+const EXCEPTION_STACK_TOP: usize = 0xffff_0000;
+const KERNEL_LOAD_OFFSET: usize = 0xffd0_0000;
+const KERNEL_ARGUMENT_OFFSET: usize = 0xffc0_0000;
 
 const FLG_VALID: usize = 0x1;
 const FLG_X: usize = 0x8;
@@ -143,6 +143,53 @@ pub struct InitialProcess {
     sp: usize,
 }
 
+#[repr(C)]
+pub struct MiniElfSection {
+    // Virtual address of this section
+    virt: u32,
+
+    // A combination of the size and flags
+    size_and_flags: &'static [u8; 4],
+}
+
+impl MiniElfSection {
+    pub fn size(&self) -> usize {
+        let mut val = u32::from_le_bytes(*self.size_and_flags);
+        val &= u32::from_le_bytes([0xff, 0xff, 0xff, 0]);
+        (val as usize) << 2
+    }
+
+    pub fn flags(&self) -> usize {
+        let le_bytes = self.size_and_flags;
+        le_bytes[3] as usize
+    }
+}
+
+/// Describes a Mini ELF file, suitable for loading into RAM
+pub struct MiniElf {
+    /// Physical source address of this program in RAM (i.e. SPI flash).
+    pub load_offset: u32,
+
+    /// Virtual address of the entrypoint
+    pub entry_point: u32,
+
+    /// All of the sections inside this file
+    pub sections: &'static [MiniElfSection],
+}
+
+impl MiniElf {
+    pub fn new(tag: &KernelArgument) -> Self {
+        let ptr = tag.data.as_ptr();
+        unsafe {
+            MiniElf {
+                load_offset: ptr.add(0).read(),
+                entry_point: ptr.add(1).read(),
+                sections: slice::from_raw_parts(ptr.add(2) as *mut MiniElfSection, (tag.size as usize - 8) / 4),
+            }
+        }
+    }
+}
+
 /// This describes the kernel as well as initially-loaded processes
 #[repr(C)]
 pub struct ProgramDescription {
@@ -198,18 +245,18 @@ impl ProgramDescription {
         let pid_idx = (pid - 1) as usize;
         let is_kernel = pid == 1;
         let flag_defaults = FLG_R | FLG_W | if is_kernel { 0 } else { FLG_U };
-        let stack_addr = USER_STACK_OFFSET;
+        let stack_addr = USER_STACK_TOP - 4;
         if is_kernel {
             assert!(self.text_offset as usize == KERNEL_LOAD_OFFSET);
-            assert!(((self.text_offset + self.text_size) as usize) < EXCEPTION_STACK_OFFSET);
+            assert!(((self.text_offset + self.text_size) as usize) < EXCEPTION_STACK_TOP);
             assert!(
                 ((self.data_offset + self.data_size + self.bss_size) as usize)
-                    < EXCEPTION_STACK_OFFSET
+                    < EXCEPTION_STACK_TOP - 4
             );
             assert!(self.data_offset as usize >= KERNEL_LOAD_OFFSET);
         } else {
-            assert!(self.text_offset as usize >= USER_AREA_START);
-            assert!(self.data_offset as usize >= USER_AREA_START);
+            assert!(((self.text_offset + self.text_size) as usize) < USER_AREA_END);
+            assert!(((self.data_offset + self.data_size) as usize) < USER_AREA_END);
         }
 
         // SATP must be nonzero
@@ -250,7 +297,7 @@ impl ProgramDescription {
                 allocator.map_page(
                     satp,
                     sp_page,
-                    (EXCEPTION_STACK_OFFSET - PAGE_SIZE * i) & !(PAGE_SIZE - 1),
+                    (EXCEPTION_STACK_TOP - 4 - PAGE_SIZE * i) & !(PAGE_SIZE - 1),
                     flag_defaults,
                 );
                 allocator.change_owner(pid as XousPid, sp_page);
@@ -307,7 +354,7 @@ impl ProgramDescription {
 
         // Our "earlyprintk" equivalent
         if cfg!(feature = "earlyprintk") && is_kernel {
-            allocator.map_page(satp, 0xF0002000, 0x001f_0000, FLG_R | FLG_W);
+            allocator.map_page(satp, 0xF0002000, 0xffcf_0000, FLG_R | FLG_W);
             allocator.change_owner(pid as XousPid, 0xF0002000);
         }
 
@@ -381,9 +428,9 @@ pub fn read_initial_config(cfg: &mut BootConfig) {
                 "invalid XKrn size"
             );
             kernel_seen = true;
-        } else if tag.name == make_type!("Init") {
+        } else if tag.name == make_type!("IniE") {
             assert!(
-                tag.size as usize == mem::size_of::<ProgramDescription>(),
+                tag.size >= 4,
                 "invalid Init size"
             );
             init_seen = true;
@@ -399,7 +446,11 @@ pub fn read_initial_config(cfg: &mut BootConfig) {
 /// located at the end of memory space.
 fn copy_processes(cfg: &mut BootConfig) {
     for tag in cfg.args.iter() {
-        if tag.name == make_type!("XKrn") || tag.name == make_type!("Init") {
+        if tag.name == make_type!("IniE") {
+            let fixme = 0usize;
+            let inie = MiniElf::new(&tag);
+        }
+        else if tag.name == make_type!("XKrn") {
             let prog = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
 
             // TEXT SECTION
@@ -771,14 +822,15 @@ pub fn phase_2(cfg: &mut BootConfig) {
     // page tables and mapping memory to them.
     let mut pid = 2;
     for tag in args.iter() {
-        if tag.name == make_type!("Init") {
-            println!("Mapping program into memory");
-            let init = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
-            let load_size_rounded = ((init.text_size as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1))
-                + (((init.data_size + init.bss_size) as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
-            init.load(cfg, process_offset - load_size_rounded, pid);
-            pid += 1;
-            process_offset -= load_size_rounded;
+        if tag.name == make_type!("IniE") {
+            let fixme = 0usize;
+            // println!("Mapping program into memory");
+            // let init = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
+            // let load_size_rounded = ((init.text_size as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1))
+            //     + (((init.data_size + init.bss_size) as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
+            // init.load(cfg, process_offset - load_size_rounded, pid);
+            // pid += 1;
+            // process_offset -= load_size_rounded;
         } else if tag.name == make_type!("XKrn") {
             println!("Mapping kernel into memory");
             let xkrn = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
@@ -793,7 +845,7 @@ pub fn phase_2(cfg: &mut BootConfig) {
     let krn_struct_start = cfg.sram_start as usize + cfg.sram_size - cfg.init_size;
     let krn_l1_pt_addr = cfg.processes[0].satp << 12;
     assert!(krn_struct_start & (PAGE_SIZE - 1) == 0);
-    let krn_pg0_ptr = unsafe { (krn_l1_pt_addr as *const usize).read() };
+    let krn_pg1023_ptr = unsafe { (krn_l1_pt_addr as *const usize).add(1023).read() };
 
     // Map boot-generated kernel structures into the kernel
     let satp = unsafe { &mut *(krn_l1_pt_addr as *mut PageTable) };
@@ -806,23 +858,27 @@ pub fn phase_2(cfg: &mut BootConfig) {
         );
     }
 
-    // Copy the kernel's "MMU Page 0" into every process.
+    // Copy the kernel's "MMU Page 1023" into every process.
     // This ensures a context switch into the kernel can
     // always be made, and that the `stvec` is always valid.
     // Since it's a megapage, all we need to do is write
     // the one address to get all 4MB mapped.
-    println!("Mapping MMU page 0 to all processes");
+    println!("Mapping MMU page 1023 to all processes");
     for process in cfg.processes[1..].iter() {
         let l1_pt_addr = process.satp << 12;
-        unsafe { (l1_pt_addr as *mut usize).write(krn_pg0_ptr) };
+        unsafe { (l1_pt_addr as *mut usize).add(1023).write(krn_pg1023_ptr) };
     }
 
     println!("PID1 pagetables:");
     debug::print_pagetable(cfg.processes[0].satp);
     println!("");
     println!("");
-    // println!("PID2 pagetables:");
-    // debug::print_pagetable(cfg.processes[1].satp);
+    for (pid, process) in cfg.processes[1..].iter().enumerate() {
+        println!("PID{} pagetables:", pid + 2);
+        debug::print_pagetable(process.satp);
+        println!("");
+        println!("");
+    }
     println!(
         "Runtime Page Tracker: {} bytes",
         cfg.runtime_page_tracker.len()

@@ -167,8 +167,7 @@ impl MiniElfSection {
     }
 
     pub fn no_copy(&self) -> bool {
-        // self.size_and_flags & (1 << 25) != 0
-        true
+        self.size_and_flags & (1 << 25) != 0
     }
 }
 
@@ -207,7 +206,10 @@ impl MiniElf {
 
         let mut page_addr: usize = 0;
         let mut previous_addr: usize = 0;
-        let mut top = load_offset;
+
+        // The load offset is the end of this process.  Shift it down by one page
+        // so we get the start of the first page.
+        let mut top = load_offset - PAGE_SIZE;
         let stack_addr = USER_STACK_TOP - 4;
 
         // Allocate a page to handle the top-level memory translation
@@ -489,7 +491,7 @@ pub unsafe fn bzero<T>(mut sbss: *mut T, ebss: *mut T)
 where
     T: Copy,
 {
-    println!("Zeroing out {:08x} - {:08x}", sbss as usize, ebss as usize);
+    println!("ZERO: {:08x} - {:08x}", sbss as usize, ebss as usize);
     while sbss < ebss {
         // NOTE(volatile) to prevent this from being transformed into `memclr`
         ptr::write_volatile(sbss, mem::zeroed());
@@ -503,8 +505,12 @@ where
     T: Copy,
 {
     println!(
-        "Copying {} bytes from {:08x} - {:08x}",
-        count, src as usize, dest as usize
+        "COPY: {:08x} - {:08x} {} {:08x} - {:08x}",
+        src as usize,
+        src as usize + count,
+        count,
+        dest as usize,
+        dest as usize + count
     );
     let mut offset = 0;
     while offset < (count / mem::size_of::<T>()) {
@@ -571,7 +577,7 @@ fn copy_processes(cfg: &mut BootConfig) {
         if tag.name == make_type!("IniE") {
             let mut page_addr: usize = 0;
             let mut previous_addr: usize = 0;
-            let mut top = cfg.get_top();
+            let mut top = 0 as *mut usize;
 
             let inie = MiniElf::new(&tag);
             let mut src_addr = unsafe {
@@ -628,6 +634,16 @@ fn copy_processes(cfg: &mut BootConfig) {
                     // Allocate a new page.
                     cfg.extra_pages += 1;
                     top = cfg.get_top();
+
+                    // Zero out the page, if necessary.
+                    unsafe {
+                        bzero(
+                            top,
+                            top.add(
+                                (section.virt as usize & (PAGE_SIZE - 1)) / mem::size_of::<usize>(),
+                            ),
+                        )
+                    };
                 }
 
                 // Part 1: Copy the first chunk over.
@@ -638,13 +654,14 @@ fn copy_processes(cfg: &mut BootConfig) {
                 let first_chunk_offset = section.virt as usize & (PAGE_SIZE - 1);
                 unsafe {
                     println!(
-                        "First chunk is {} bytes, copying from {:08x}:{:08x} -> {:08x}:{:08x}",
+                        "First chunk is {} bytes, copying from {:08x}:{:08x} -> {:08x}:{:08x} (virt: {:08x})",
                         first_chunk_size,
                         src_addr as usize,
                         src_addr.add(first_chunk_size / 4) as usize,
                         top.add(first_chunk_offset / mem::size_of::<usize>()) as usize,
                         top.add((first_chunk_size + first_chunk_offset) / mem::size_of::<usize>())
                             as usize,
+                        this_page + first_chunk_offset,
                     )
                 };
                 // Perform the copy, if NOCOPY is not set
@@ -673,10 +690,10 @@ fn copy_processes(cfg: &mut BootConfig) {
                 while bytes_to_copy > PAGE_SIZE {
                     cfg.extra_pages += 1;
                     top = cfg.get_top();
-                    println!(
-                        "Copying next page from {:08x} {:08x}",
-                        src_addr as usize, top as usize
-                    );
+                    // println!(
+                    //     "Copying next page from {:08x} {:08x}",
+                    //     src_addr as usize, top as usize
+                    // );
                     if !section.no_copy() {
                         unsafe {
                             memcpy(top, src_addr, PAGE_SIZE);
@@ -795,11 +812,18 @@ impl BootConfig {
                 (self.sram_size - self.init_size - self.extra_pages * PAGE_SIZE)
                     / mem::size_of::<usize>(),
             );
-            println!("top address: {:08x}", t as usize);
+            // println!("top address: {:08x}", t as usize);
             t
         };
         assert!((val as usize) >= (self.sram_start as usize));
-        assert!((val as usize) < (self.sram_start as usize) + self.sram_size);
+        assert!(
+            (val as usize) < (self.sram_start as usize) + self.sram_size,
+            "top address {:08x} > (start + size) {:08x} + {} = {:08x}",
+            val as usize,
+            self.sram_start as usize,
+            self.sram_size,
+            self.sram_start as usize + self.sram_size
+        );
         val
     }
 
@@ -1087,6 +1111,7 @@ pub fn phase_2(cfg: &mut BootConfig) {
 
     // This is the offset in RAM where programs are loaded from.
     let mut process_offset = cfg.sram_start as usize + cfg.sram_size - cfg.init_size;
+    println!("Procesess start out @ {:08x}", process_offset);
 
     // Go through all Init processes and the kernel, setting up their
     // page tables and mapping memory to them.

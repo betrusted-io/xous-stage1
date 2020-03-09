@@ -256,8 +256,8 @@ impl MiniElf {
         for section in self.sections {
             let flag_defaults = FLG_U
                 | FLG_R
-                | if section.flags() & 1 == 1 { FLG_X } else { 0 }
-                | if section.flags() & 4 == 4 { FLG_W } else { 0 };
+                | if section.flags() & 1 == 1 { FLG_W } else { 0 }
+                | if section.flags() & 4 == 4 { FLG_X } else { 0 };
 
             if (section.virt as usize) < previous_addr {
                 panic!("init section addresses are not strictly increasing");

@@ -652,18 +652,16 @@ fn copy_processes(cfg: &mut BootConfig) {
                     first_chunk_size = section.len();
                 }
                 let first_chunk_offset = section.virt as usize & (PAGE_SIZE - 1);
-                unsafe {
-                    println!(
-                        "First chunk is {} bytes, copying from {:08x}:{:08x} -> {:08x}:{:08x} (virt: {:08x})",
-                        first_chunk_size,
-                        src_addr as usize,
-                        src_addr.add(first_chunk_size / 4) as usize,
-                        top.add(first_chunk_offset / mem::size_of::<usize>()) as usize,
-                        top.add((first_chunk_size + first_chunk_offset) / mem::size_of::<usize>())
-                            as usize,
-                        this_page + first_chunk_offset,
-                    )
-                };
+                println!(
+                    "First chunk is {} bytes, copying from {:08x}:{:08x} -> {:08x}:{:08x} (virt: {:08x})",
+                    first_chunk_size,
+                    src_addr as usize,
+                    unsafe { src_addr.add(first_chunk_size / 4) as usize },
+                    unsafe { top.add(first_chunk_offset / mem::size_of::<usize>()) as usize },
+                    unsafe { top.add((first_chunk_size + first_chunk_offset) / mem::size_of::<usize>())
+                        as usize },
+                    this_page + first_chunk_offset,
+                );
                 // Perform the copy, if NOCOPY is not set
                 if !section.no_copy() {
                     unsafe {
@@ -1167,8 +1165,8 @@ pub fn phase_2(cfg: &mut BootConfig) {
     debug::print_pagetable(cfg.processes[0].satp);
     println!("");
     println!("");
-    for (pid, process) in cfg.processes[1..].iter().enumerate() {
-        println!("PID{} pagetables:", pid + 2);
+    for (_pid, process) in cfg.processes[1..].iter().enumerate() {
+        println!("PID{} pagetables:", _pid + 2);
         debug::print_pagetable(process.satp);
         println!("");
         println!("");

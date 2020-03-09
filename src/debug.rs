@@ -54,17 +54,29 @@ mod debug_print_hardware {
     }
 }
 
+#[macro_use]
+#[cfg(test)]
+mod debug_print_hardware {
+    #[macro_export]
+    #[allow(unused_variables)]
+    macro_rules! print {
+        ($($args:tt)+) => ({
+            std::print!($($args)+)
+        });
+    }
+}
+
 #[macro_export]
 macro_rules! println
 {
     () => ({
-        print!("\r\n")
+        $crate::print!("\r\n")
     });
     ($fmt:expr) => ({
-        print!(concat!($fmt, "\r\n"))
+        $crate::print!(concat!($fmt, "\r\n"))
     });
     ($fmt:expr, $($args:tt)+) => ({
-        print!(concat!($fmt, "\r\n"), $($args)+)
+        $crate::print!(concat!($fmt, "\r\n"), $($args)+)
     });
 }
 

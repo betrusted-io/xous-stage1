@@ -3,7 +3,7 @@
 
 #[macro_use]
 mod args;
-use args::{KernelArguments, KernelArgument};
+use args::{KernelArgument, KernelArguments};
 
 use core::{mem, ptr, slice};
 
@@ -40,7 +40,7 @@ mod panic_handler {
     use core::panic::PanicInfo;
     #[panic_handler]
     fn handle_panic(_arg: &PanicInfo) -> ! {
-        // sprintln!("{}", _arg);
+        crate::println!("{}", _arg);
         loop {}
     }
 }
@@ -146,22 +146,29 @@ pub struct InitialProcess {
 #[repr(C)]
 pub struct MiniElfSection {
     // Virtual address of this section
-    virt: u32,
+    pub virt: u32,
 
     // A combination of the size and flags
-    size_and_flags: &'static [u8; 4],
+    size_and_flags: u32,
 }
 
 impl MiniElfSection {
-    pub fn size(&self) -> usize {
-        let mut val = u32::from_le_bytes(*self.size_and_flags);
-        val &= u32::from_le_bytes([0xff, 0xff, 0xff, 0]);
-        (val as usize) << 2
+    pub fn len(&self) -> usize {
+        // Strip off the top four bits, which contain the flags.
+        // Also shift everything up by two bits, since it's in
+        // units of 32-bit words.
+        let len = (self.size_and_flags << 2) & !0xf000_0000;
+        len as usize
     }
 
     pub fn flags(&self) -> usize {
-        let le_bytes = self.size_and_flags;
-        le_bytes[3] as usize
+        let le_bytes = self.size_and_flags >> 24;
+        le_bytes as usize
+    }
+
+    pub fn no_copy(&self) -> bool {
+        // self.size_and_flags & (1 << 25) != 0
+        true
     }
 }
 
@@ -184,9 +191,122 @@ impl MiniElf {
             MiniElf {
                 load_offset: ptr.add(0).read(),
                 entry_point: ptr.add(1).read(),
-                sections: slice::from_raw_parts(ptr.add(2) as *mut MiniElfSection, (tag.size as usize - 8) / 4),
+                sections: slice::from_raw_parts(
+                    ptr.add(2) as *mut MiniElfSection,
+                    (tag.size as usize - 8) / mem::size_of::<MiniElfSection>(),
+                ),
             }
         }
+    }
+
+    /// Load the process into its own memory space.
+    /// The process will have been already loaded in stage 1.  This simply assigns
+    /// memory maps as necessary.
+    pub fn load(&self, allocator: &mut BootConfig, load_offset: usize, pid: XousPid) -> usize {
+        let mut allocated_bytes = 0;
+
+        let mut page_addr: usize = 0;
+        let mut previous_addr: usize = 0;
+        let mut top = load_offset;
+        let stack_addr = USER_STACK_TOP - 4;
+
+        // Allocate a page to handle the top-level memory translation
+        let satp_address = allocator.alloc() as usize;
+        allocator.change_owner(pid as XousPid, satp_address);
+
+        // Turn the satp address into a pointer
+        let satp = unsafe { &mut *(satp_address as *mut PageTable) };
+        allocator.map_page(satp, satp_address, PAGE_TABLE_ROOT_OFFSET, FLG_R | FLG_W);
+
+        // Allocate context for this process
+        let context_address = allocator.alloc() as usize;
+        allocator.map_page(satp, context_address, CONTEXT_OFFSET, FLG_R | FLG_W);
+
+        // Ensure the pagetables are mapped as well
+        let pt_addr = allocator.alloc() as usize;
+        allocator.map_page(satp, pt_addr, PAGE_TABLE_OFFSET + 0, FLG_R | FLG_W);
+
+        // Allocate stack pages.
+        for i in 0..STACK_PAGE_COUNT {
+            let sp_page = allocator.alloc() as usize;
+            allocator.map_page(
+                satp,
+                sp_page,
+                (stack_addr - PAGE_SIZE * i) & !(PAGE_SIZE - 1),
+                FLG_U | FLG_R | FLG_W,
+            );
+            allocator.change_owner(pid as XousPid, sp_page);
+        }
+
+        // Example: Page starts at 0xf0c0 and is 8192 bytes long.
+        // 1. Copy 3094 bytes to page 1
+        // 2. Copy 4096 bytes to page 2
+        // 3. Copy 192 bytes to page 3
+        //
+        // Example: Page starts at 0xf000 and is 4096 bytes long
+        // 1. Copy 4096 bytes to page 1
+        //
+        // Example: Page starts at 0xf000 and is 128 bytes long
+        // 1. Copy 128 bytes to page 1
+        //
+        // Example: Page starts at oxf0c0 and is 128 bytes long
+        // 1. Copy 128 bytes to page 1
+        for section in self.sections {
+            let flag_defaults = FLG_U
+                | FLG_R
+                | if section.flags() & 1 == 1 { FLG_X } else { 0 }
+                | if section.flags() & 4 == 4 { FLG_W } else { 0 };
+
+            if (section.virt as usize) < previous_addr {
+                panic!("init section addresses are not strictly increasing");
+            }
+
+            let mut this_page = section.virt as usize & !(PAGE_SIZE - 1);
+            let mut bytes_to_copy = section.len();
+
+            // If this is not a new page, ensure the uninitialized values from between
+            // this section and the previous one are all zeroed out.
+            if this_page != page_addr {
+                allocator.map_page(satp, top as usize, this_page, flag_defaults);
+                allocated_bytes += PAGE_SIZE;
+                top -= PAGE_SIZE;
+                this_page += PAGE_SIZE;
+            }
+
+            // Part 1: Copy the first chunk over.
+            let mut first_chunk_size = PAGE_SIZE - (section.virt as usize & (PAGE_SIZE - 1));
+            if first_chunk_size > section.len() {
+                first_chunk_size = section.len();
+            }
+            bytes_to_copy -= first_chunk_size;
+
+            // Part 2: Copy any full pages.
+            while bytes_to_copy > PAGE_SIZE {
+                allocator.map_page(satp, top as usize, this_page, flag_defaults);
+                allocated_bytes += PAGE_SIZE;
+                top -= PAGE_SIZE;
+                this_page += PAGE_SIZE;
+                bytes_to_copy -= PAGE_SIZE;
+            }
+
+            // Part 3: Copy the final residual partial page
+            if bytes_to_copy > 0 {
+                allocator.map_page(satp, top as usize, this_page, flag_defaults);
+                allocated_bytes += PAGE_SIZE;
+                top -= PAGE_SIZE;
+                // this_page += PAGE_SIZE;
+            }
+
+            previous_addr = section.virt as usize + section.len();
+            page_addr = previous_addr & !(PAGE_SIZE - 1);
+        }
+
+        let ref mut process = allocator.processes[pid as usize - 1];
+        process.entrypoint = self.entry_point as usize;
+        process.sp = stack_addr;
+        process.satp = 0x80000000 | ((pid as usize) << 22) | (satp_address >> 12);
+
+        allocated_bytes
     }
 }
 
@@ -369,6 +489,7 @@ pub unsafe fn bzero<T>(mut sbss: *mut T, ebss: *mut T)
 where
     T: Copy,
 {
+    println!("Zeroing out {:08x} - {:08x}", sbss as usize, ebss as usize);
     while sbss < ebss {
         // NOTE(volatile) to prevent this from being transformed into `memclr`
         ptr::write_volatile(sbss, mem::zeroed());
@@ -381,6 +502,10 @@ pub unsafe fn memcpy<T>(dest: *mut T, src: *const T, count: usize)
 where
     T: Copy,
 {
+    println!(
+        "Copying {} bytes from {:08x} - {:08x}",
+        count, src as usize, dest as usize
+    );
     let mut offset = 0;
     while offset < (count / mem::size_of::<T>()) {
         dest.add(offset)
@@ -429,10 +554,7 @@ pub fn read_initial_config(cfg: &mut BootConfig) {
             );
             kernel_seen = true;
         } else if tag.name == make_type!("IniE") {
-            assert!(
-                tag.size >= 4,
-                "invalid Init size"
-            );
+            assert!(tag.size >= 4, "invalid Init size");
             init_seen = true;
             cfg.init_process_count += 1;
         }
@@ -447,10 +569,154 @@ pub fn read_initial_config(cfg: &mut BootConfig) {
 fn copy_processes(cfg: &mut BootConfig) {
     for tag in cfg.args.iter() {
         if tag.name == make_type!("IniE") {
-            let fixme = 0usize;
+            let mut page_addr: usize = 0;
+            let mut previous_addr: usize = 0;
+            let mut top = cfg.get_top();
+
             let inie = MiniElf::new(&tag);
-        }
-        else if tag.name == make_type!("XKrn") {
+            let mut src_addr = unsafe {
+                cfg.base_addr
+                    .add(inie.load_offset as usize / mem::size_of::<usize>())
+            };
+
+            // Example: Page starts at 0xf0c0 and is 8192 bytes long.
+            // 1. Copy 3094 bytes to page 1
+            // 2. Copy 4096 bytes to page 2
+            // 3. Copy 192 bytes to page 3
+            //
+            // Example: Page starts at 0xf000 and is 4096 bytes long
+            // 1. Copy 4096 bytes to page 1
+            //
+            // Example: Page starts at 0xf000 and is 128 bytes long
+            // 1. Copy 128 bytes to page 1
+            //
+            // Example: Page starts at oxf0c0 and is 128 bytes long
+            // 1. Copy 128 bytes to page 1
+            println!("IniE has {} sections", inie.sections.len());
+            for section in inie.sections.iter() {
+                if (section.virt as usize) < previous_addr {
+                    panic!("init section addresses are not strictly increasing (new virt: {:08x}, last virt: {:08x}", section.virt, previous_addr);
+                }
+
+                let this_page = section.virt as usize & !(PAGE_SIZE - 1);
+                let mut bytes_to_copy = section.len();
+
+                println!(
+                    "Section is {} bytes long, loaded to {:08x}",
+                    bytes_to_copy, section.virt
+                );
+                // If this is not a new page, ensure the uninitialized values from between
+                // this section and the previous one are all zeroed out.
+                if this_page != page_addr {
+                    println!("New page @ {:08x}", this_page);
+                    if previous_addr != 0 {
+                        println!(
+                            "Zeroing-out remainder of previous page: {:08x} (mapped to physical address {:08x})",
+                            previous_addr, top as usize,
+                        );
+                        unsafe {
+                            bzero(
+                                top.add(
+                                    (previous_addr as usize & (PAGE_SIZE - 1))
+                                        / mem::size_of::<usize>(),
+                                ),
+                                top.add(PAGE_SIZE as usize / mem::size_of::<usize>()),
+                            )
+                        };
+                    }
+
+                    // Allocate a new page.
+                    cfg.extra_pages += 1;
+                    top = cfg.get_top();
+                }
+
+                // Part 1: Copy the first chunk over.
+                let mut first_chunk_size = PAGE_SIZE - (section.virt as usize & (PAGE_SIZE - 1));
+                if first_chunk_size > section.len() {
+                    first_chunk_size = section.len();
+                }
+                let first_chunk_offset = section.virt as usize & (PAGE_SIZE - 1);
+                unsafe {
+                    println!(
+                        "First chunk is {} bytes, copying from {:08x}:{:08x} -> {:08x}:{:08x}",
+                        first_chunk_size,
+                        src_addr as usize,
+                        src_addr.add(first_chunk_size / 4) as usize,
+                        top.add(first_chunk_offset / mem::size_of::<usize>()) as usize,
+                        top.add((first_chunk_size + first_chunk_offset) / mem::size_of::<usize>())
+                            as usize,
+                    )
+                };
+                // Perform the copy, if NOCOPY is not set
+                if !section.no_copy() {
+                    unsafe {
+                        memcpy(
+                            top.add(first_chunk_offset / mem::size_of::<usize>()),
+                            src_addr,
+                            first_chunk_size,
+                        );
+                        src_addr = src_addr.add(first_chunk_size / mem::size_of::<usize>());
+                    }
+                } else {
+                    unsafe {
+                        bzero(
+                            top.add(first_chunk_offset / mem::size_of::<usize>()),
+                            top.add(
+                                (first_chunk_offset + first_chunk_size) / mem::size_of::<usize>(),
+                            ),
+                        );
+                    }
+                }
+                bytes_to_copy -= first_chunk_size;
+
+                // Part 2: Copy any full pages.
+                while bytes_to_copy > PAGE_SIZE {
+                    cfg.extra_pages += 1;
+                    top = cfg.get_top();
+                    println!(
+                        "Copying next page from {:08x} {:08x}",
+                        src_addr as usize, top as usize
+                    );
+                    if !section.no_copy() {
+                        unsafe {
+                            memcpy(top, src_addr, PAGE_SIZE);
+                            src_addr = src_addr.add(PAGE_SIZE / mem::size_of::<usize>());
+                        }
+                    } else {
+                        unsafe { bzero(top, top.add(PAGE_SIZE / 4)) };
+                    }
+                    bytes_to_copy -= PAGE_SIZE;
+                }
+
+                // Part 3: Copy the final residual partial page
+                if bytes_to_copy > 0 {
+                    println!("Copying final section -- {} bytes", bytes_to_copy);
+                    cfg.extra_pages += 1;
+                    top = cfg.get_top();
+                    if !section.no_copy() {
+                        unsafe {
+                            memcpy(top, src_addr, bytes_to_copy);
+                            src_addr = src_addr.add(bytes_to_copy / mem::size_of::<usize>());
+                        }
+                    } else {
+                        unsafe { bzero(top, top.add(bytes_to_copy / 4)) };
+                    }
+                }
+
+                previous_addr = section.virt as usize + section.len();
+                page_addr = previous_addr & !(PAGE_SIZE - 1);
+                println!("Looping to the next section");
+            }
+
+            println!("Done with sections, zeroing out remaining data");
+            // Zero-out the trailing bytes
+            unsafe {
+                bzero(
+                    top.add((previous_addr as usize & (PAGE_SIZE - 1)) / mem::size_of::<usize>()),
+                    top.add(PAGE_SIZE as usize / mem::size_of::<usize>()),
+                )
+            };
+        } else if tag.name == make_type!("XKrn") {
             let prog = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
 
             // TEXT SECTION
@@ -525,10 +791,12 @@ fn copy_processes(cfg: &mut BootConfig) {
 impl BootConfig {
     fn get_top(&self) -> *mut usize {
         let val = unsafe {
-            self.sram_start.add(
+            let t = self.sram_start.add(
                 (self.sram_size - self.init_size - self.extra_pages * PAGE_SIZE)
                     / mem::size_of::<usize>(),
-            )
+            );
+            println!("top address: {:08x}", t as usize);
+            t
         };
         assert!((val as usize) >= (self.sram_start as usize));
         assert!((val as usize) < (self.sram_start as usize) + self.sram_size);
@@ -627,10 +895,12 @@ impl BootConfig {
         let ref mut l0_pt = l0_pt_idx.entries;
 
         // Ensure the entry hasn't already been mapped.
-        // if l0_pt[vpn0 as usize] & 1 != 0 {
+        // if l0_pt[vpn0] & 1 != 0 {
         //     panic!("Page already allocated!");
         // }
-        l0_pt[vpn0] = (ppn1 << 20) | (ppn0 << 10) | flags | FLG_VALID | FLG_D | FLG_A;
+        let previous_flags = l0_pt[vpn0] & 0xf;
+        l0_pt[vpn0] =
+            (ppn1 << 20) | (ppn0 << 10) | flags | previous_flags | FLG_VALID | FLG_D | FLG_A;
 
         // If we had to allocate a level 1 pagetable entry, ensure that it's
         // mapped into our address space.
@@ -823,14 +1093,13 @@ pub fn phase_2(cfg: &mut BootConfig) {
     let mut pid = 2;
     for tag in args.iter() {
         if tag.name == make_type!("IniE") {
-            let fixme = 0usize;
-            // println!("Mapping program into memory");
+            let inie = MiniElf::new(&tag);
+            println!("Mapping program into memory");
             // let init = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };
             // let load_size_rounded = ((init.text_size as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1))
             //     + (((init.data_size + init.bss_size) as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1));
-            // init.load(cfg, process_offset - load_size_rounded, pid);
-            // pid += 1;
-            // process_offset -= load_size_rounded;
+            process_offset -= inie.load(cfg, process_offset, pid);
+            pid += 1;
         } else if tag.name == make_type!("XKrn") {
             println!("Mapping kernel into memory");
             let xkrn = unsafe { &*(tag.data.as_ptr() as *const ProgramDescription) };

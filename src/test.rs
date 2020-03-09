@@ -191,7 +191,7 @@ fn read_word(satp: usize, virt: usize) -> Result<u32, &'static str> {
     Ok(unsafe { (page_base as *mut u32).read() })
 }
 
-fn verify_program(cfg: &BootConfig, pid: usize, arg: &crate::args::KernelArgument) {
+fn verify_kernel(cfg: &BootConfig, pid: usize, arg: &crate::args::KernelArgument) {
     let prog = unsafe { &*(arg.data.as_ptr() as *const crate::ProgramDescription) };
     let program_offset = prog.load_offset as usize;
     let mut src_text = vec![];
@@ -218,14 +218,19 @@ fn verify_program(cfg: &BootConfig, pid: usize, arg: &crate::args::KernelArgumen
     println!(
         "Inspecting {} bytes of PID ({} bytes of text, {} bytes of data) {}, starting from {:08x}",
         src_text.len() * 4 + src_data.len() * 4,
-        src_text.len() * 4, src_data.len() * 4,
+        src_text.len() * 4,
+        src_data.len() * 4,
         pid,
         prog.load_offset
     );
     for addr in (0..(prog.text_size as usize)).step_by(4) {
         assert_eq!(
             src_text[addr],
-            read_word(cfg.processes[pid].satp as usize, addr + prog.text_offset as usize).unwrap(),
+            read_word(
+                cfg.processes[pid].satp as usize,
+                addr + prog.text_offset as usize
+            )
+            .unwrap(),
             "program text doesn't match @ offset {:08x}",
             addr + prog.text_offset as usize
         );
@@ -234,20 +239,61 @@ fn verify_program(cfg: &BootConfig, pid: usize, arg: &crate::args::KernelArgumen
     for addr in (0..(prog.data_size as usize)).step_by(4) {
         assert_eq!(
             src_data[addr],
-            read_word(cfg.processes[pid].satp as usize, addr + prog.data_offset as usize).unwrap(),
+            read_word(
+                cfg.processes[pid].satp as usize,
+                addr + prog.data_offset as usize
+            )
+            .unwrap(),
             "program data doesn't match @ offset {:08x}",
             addr + prog.data_offset as usize
         );
     }
 
-    for addr in ((prog.data_size as usize)..((prog.data_size + prog.bss_size) as usize)).step_by(4) {
-        println!("Verifying BSS @ {:08x} is 0", addr + prog.data_offset as usize);
+    for addr in ((prog.data_size as usize)..((prog.data_size + prog.bss_size) as usize)).step_by(4)
+    {
+        println!(
+            "Verifying BSS @ {:08x} is 0",
+            addr + prog.data_offset as usize
+        );
         assert_eq!(
             0,
-            read_word(cfg.processes[pid].satp as usize, addr + prog.data_offset as usize).unwrap(),
+            read_word(
+                cfg.processes[pid].satp as usize,
+                addr + prog.data_offset as usize
+            )
+            .unwrap(),
             "bss is not zero @ offset {:08x}",
             addr + prog.data_offset as usize
         );
+    }
+}
+
+fn verify_program(cfg: &BootConfig, pid: usize, arg: &crate::args::KernelArgument) {
+    let elf = crate::MiniElf::new(arg);
+    let mut program_offset = elf.load_offset as usize;
+
+    for section in elf.sections.iter() {
+        for addr in (section.virt..(section.virt + section.len() as u32)).step_by(4) {
+            let addr = addr as usize;
+            let word = read_word(cfg.processes[pid].satp as usize, addr).unwrap();
+            if section.no_copy() {
+                assert!(word == 0, "bss is {:08x}, not 0 @ {:08x}", word, addr);
+            } else {
+                let check_word = unsafe {
+                    (cfg.base_addr as *mut u32)
+                        .add(program_offset / 4)
+                        .read()
+                };
+                program_offset += 4;
+                assert!(
+                    word == check_word,
+                    "program doesn't match @ {:08x} (expected: {:08x}  found: {:08x})",
+                    addr,
+                    check_word,
+                    word,
+                );
+            }
+        }
     }
 }
 
@@ -265,10 +311,10 @@ fn full_boot() {
     let mut init_index = 0;
     for arg in env.cfg.args.iter() {
         if arg.name == make_type!("XKrn") {
-            verify_program(&env.cfg, 0, &arg);
+            verify_kernel(&env.cfg, 0, &arg);
             assert!(xkrn_inspected == false, "multiple kernels found");
             xkrn_inspected = true;
-        } else if arg.name == make_type!("Init") {
+        } else if arg.name == make_type!("IniE") {
             init_index += 1;
             verify_program(&env.cfg, init_index, &arg);
         }
